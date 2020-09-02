@@ -372,18 +372,21 @@ void setup()
   setupRelays();                                                                          // relays
 }
 
-#define MAXLOOPTIME     15000
-#define MAXTIMEDELAY    1000
-#define SKIPCOUNT       5
+unsigned long displaytime;
+unsigned long maxdtime;
+#define MAXLOOPTIME     15000                                                             // max loop time in microseconds
+#define MAXTIMEDELAY    1000                                                              // time maxtime not over to reset error led in milliseconds
+#define SKIPCOUNT       20                                                                // lots of initialization the first few times round loop
 /*
- * Monitor timing of main loop and error if too large. Loop times are < 7.5ms and most are < 1ms
+ * Monitor timing of main loop and error if too large. Loop times are < 7-8ms and most are < 1ms
  */
 void MonitorTimingLoop()
 {
   static int startc = SKIPCOUNT;
   static unsigned long maxtimetaken;
   static bool takentiming = false;
-  static unsigned long avertime = 0, mintime = 0xffffffff, maxtime = 0, lastime = 0;
+  static int maxovercount = 0;
+  static unsigned long avertime = 0, mintime = 0xffffffff, maxtime = 0, maxtime2 = 0, lastime = 0;
   unsigned long curtime = micros();
   unsigned long delta = curtime - lastime;
   lastime = curtime;
@@ -395,26 +398,31 @@ void MonitorTimingLoop()
   }
   else
   {
-    if(maxtime > MAXLOOPTIME)
-    {
-      if(!takentiming)
-      {
-        maxtimetaken = millis();
-        takentiming = true;
-      }
-      else if((maxtimetaken - millis()) > MAXTIMEDELAY)
-      {
-        takentiming = false;
-        maxtime = (maxtime + delta)/2;
-        clearState();
-        if(debugon) Serial.printf("Loop times reset: aver %lu, min %lu, max %lu\n", avertime, mintime, maxtime);
-      }
-    }
-    avertime = (avertime + delta)/2;
+    avertime = (avertime + delta)/2;                                                      // track average, min and max loop times
     if(delta < mintime) mintime = delta;
     if(delta > maxtime) maxtime = delta;
-    if((avertime > MAXLOOPTIME) || (maxtime > MAXLOOPTIME))
-      errorState();                                                                       // set the error led, if average or max are too large
+    if((delta > maxtime2) and (delta < MAXLOOPTIME)) maxtime2 = delta;                    // max loop times, not over limit
+    if(displaytime > maxdtime) maxdtime = displaytime;
+    if(maxtime > MAXLOOPTIME)                                                             // if maxtime is over
+    {
+      if(delta > MAXLOOPTIME)                                                             // delta is over reset timing loop
+      {
+        if(!takentiming)                                                                  // new over limit occurance
+        {
+          maxovercount++;                                                                 // count each time goes over limit
+          takentiming = true;
+          errorState();                                                                   // set the error led, if max is too large
+        }
+        maxtimetaken = millis();                                                          // restart timer
+      }
+      else if(takentiming && ((maxtimetaken - millis()) > MAXTIMEDELAY))                  // if delta is undert for last MAXTIMEDELAY
+      {
+        takentiming = false;
+        clearState();                                                                     // reset error led
+        if(debugon) Serial.printf("Loop times reset: aver %lu, min %lu, max %lu display %lu %lu\n", avertime, mintime, maxtime, displaytime, maxdtime);
+        maxtime = maxtime2;                                                               // reduce maxtime to under limit
+      }
+    }
   }
   if(debugon)
   {
@@ -422,8 +430,8 @@ void MonitorTimingLoop()
     if((millis() - lastdistime) > DEBUGDELAY)
     {
       lastdistime = millis();
-      Serial.printf("Loop times%s: aver %lu, min %lu, max %lu\n",
-        (!startc && ((avertime > MAXLOOPTIME) || (maxtime > MAXLOOPTIME)))?" too large":"", avertime, mintime, maxtime);
+      Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d display %lu %lu\n",
+        (!startc && ((avertime > MAXLOOPTIME) || (maxtime > MAXLOOPTIME)))?" too large":"", avertime, mintime, maxtime, maxovercount, displaytime, maxdtime);
     }
   }
 }
@@ -615,6 +623,7 @@ void UpdateDisplay()
   int startpart = part;                                                                   // which UI part this call started from
   bool updateddisplay = false;                                                            // UI part updated
 
+  displaytime = micros();
   do
   {
     switch(part)                                                                          // break display updates up, 1 on each time round main loop
@@ -654,8 +663,10 @@ void UpdateDisplay()
       break;
     }
     ++part %= 11;
-  } while(0); //while(!updateddisplay && (startpart != part));                                        // loop until we have updated 1 UI part or tried them all
+  } while(0);                                                                             // dont loop to reduce loop times due to display updates - check whether it is display that causes delay
+  //while(!updateddisplay && (startpart != part));                                        // loop until we have updated 1 UI part or tried them all
   if(rets && debugon) Serial.printf("Display update failures %lx\n", rets);
+  displaytime = micros() - displaytime;                                                   // display update time
 }
 
 #define SensorDelay   100
