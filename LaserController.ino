@@ -61,14 +61,14 @@ bool debugon = false;                                                           
  *  digital input and temperature input values 
  */
 bool AirAssistValveInput = true;
-short intempF, intempC;
-unsigned short pulseperiod[4];
+short intemp[2];
+volatile unsigned short pulseperiod[4];
 
 /* 
  *  last UI values - save updating UI except when needed 
  */
 unsigned short oldpulseperiod[4];
-short oldintempF, oldintempC;
+short oldintemp[2];
 bool oldCurrent_Cool_State;
 
 /* 
@@ -100,7 +100,7 @@ void clearState() { digitalWrite(LED_PIN, LED_OFF); }
 #define ANALOGRESOLUTION  ADC_RESOLUTION                                                  // ADC resolution
 #define ANALOGRANGEMAX    ((1<<ANALOGRESOLUTION)-1)                                       // max value of ADC
 
-const unsigned long debounceDelay = 10000;                                                // the debounce time (us), max freq 100/sec
+const unsigned long debounceDelay = 5000;                                                 // the debounce time (us), max freq 100/sec
 const unsigned long stoppedDelay = 1000000;                                               // after 1sec without any pin state changes, set to 0 pulses/sec
 const byte pinpin[] = { TIME_PIN0, TIME_PIN1, TIME_PIN2, TIME_PIN3, INPUT_PIN };
 
@@ -117,7 +117,7 @@ volatile unsigned long averriseperiodtemp[PINPINSIZE];                          
  *  Display information
  */
 bool displayavailable = false;                                                            // whether we found display correctly
-const int displayStartupDelay = 1000;                                                     // delay for display to initialize
+const int displayStartupDelay = 500;                                                      // delay for display to initialize
 
 #define RED     63488                                                                     // UI colors
 #define GREEN    2016
@@ -225,11 +225,11 @@ void ButtonCallback(void *p)
  */
 void dointerrupt(int p)
 {
-  byte cstate = digitalRead(pinpin[p]);                                                   // current input value
-  unsigned long curtime = micros();                                                       // current time
+  volatile byte cstate = digitalRead(pinpin[p]);                                          // current input value
+  volatile unsigned long curtime = micros();                                              // current time
   if(lastpinstate[p] != cstate)                                                           // pin change, start debounce, shouldn't really need this test
   {
-    unsigned long dtime = debtime[p];                                                     // last time pin changed
+    volatile unsigned long dtime = debtime[p];                                            // last time pin changed
     if ((curtime - dtime) > debounceDelay)                                                // pulse is valid
     {
       if (lastpinstate[p] != pinstate[p])                                                 // debounced input has changed
@@ -239,7 +239,8 @@ void dointerrupt(int p)
         {
           averriseperiodtemp[p] = (averriseperiodtemp[p]*(LOWPASSFILTER-1) + (dtime - risetime[p]))/LOWPASSFILTER;
           risetime[p] = dtime;                                                            // time of last rising edge
-          pulseperiod[p] = (1000000L*PULSE100)/averriseperiodtemp[p];                     // calculate pulses/sec * 100
+          if(averriseperiodtemp[p])
+            pulseperiod[p] = (1000000L*PULSE100)/averriseperiodtemp[p];                   // calculate pulses/sec * 100
         }
       }
     }
@@ -286,11 +287,11 @@ void setupDisplay()
   if(debugon) Serial.printf("SetupDisplay\n");
   displayavailable = true;                                                                // assume we will find the display
   delay(displayStartupDelay);                                                             // delay to allow display to initialize
-  if(!nexInit())                                                                          // initialize connection to display and display
+  if(!nexInit(115200))                                                                    // initialize connection to display, using a modified nextion library
   {                                                                                       // sometimes the 1st command to the display fails
     if(debugon) Serial.printf("Display1\n");
-    Serial1.end();
-    if(!(displayavailable = nexInit()))                                                   // retry init display
+    nexSerial.end();
+    if(!(displayavailable = nexInit(115200)))                                             // retry init display
     {
       if(debugon) Serial.printf("Check connections to Nextion Display\n");
       errorState();                                                                       // set the error led, we have a problem
@@ -373,20 +374,19 @@ void setup()
 }
 
 unsigned long displaytime;
-unsigned long maxdtime;
+unsigned long listentime;
 #define MAXLOOPTIME     15000                                                             // max loop time in microseconds
-#define MAXTIMEDELAY    1000                                                              // time maxtime not over to reset error led in milliseconds
-#define SKIPCOUNT       20                                                                // lots of initialization the first few times round loop
+#define SKIPCOUNT       10                                                                // lots of initialization the first few times round loop
 /*
  * Monitor timing of main loop and error if too large. Loop times are < 7-8ms and most are < 1ms
+ *  Most of the delay is when updating the display, non display times < 1ms
  */
 void MonitorTimingLoop()
 {
-  static int startc = SKIPCOUNT;
-  static unsigned long maxtimetaken;
-  static bool takentiming = false;
-  static int maxovercount = 0;
-  static unsigned long avertime = 0, mintime = 0xffffffff, maxtime = 0, maxtime2 = 0, lastime = 0;
+  static int startc = SKIPCOUNT, maxcount = 0, maxdcount = 0, maxlcount = 0;
+  static unsigned long avertime = 0, mintime = 0xffffffff, maxtime = 0, lastime = 0;
+  static unsigned long averdtime = 0, mindtime = 0xffffffff, maxdtime = 0;
+  static unsigned long averltime = 0, minltime = 0xffffffff, maxltime = 0;
   unsigned long curtime = micros();
   unsigned long delta = curtime - lastime;
   lastime = curtime;
@@ -394,44 +394,37 @@ void MonitorTimingLoop()
   if(startc)                                                                              // skip average/min/max during initialization
   {
     startc--;
-    avertime = delta;
+    if(!startc) avertime = delta;
   }
   else
   {
+    delta = (delta > (displaytime+listentime))?delta-(displaytime+listentime):delta;      // track display time separately
     avertime = (avertime + delta)/2;                                                      // track average, min and max loop times
     if(delta < mintime) mintime = delta;
     if(delta > maxtime) maxtime = delta;
-    if((delta > maxtime2) and (delta < MAXLOOPTIME)) maxtime2 = delta;                    // max loop times, not over limit
+    if(delta > MAXLOOPTIME) maxcount++;
+    averdtime = (averdtime + displaytime)/2;                                              // track average, min and max display times
+    if(displaytime < mindtime) mindtime = displaytime;
     if(displaytime > maxdtime) maxdtime = displaytime;
-    if(maxtime > MAXLOOPTIME)                                                             // if maxtime is over
+    if(displaytime > MAXLOOPTIME) maxdcount++;
+    averltime = (averltime + listentime)/2;                                               // track average, min and max display times
+    if(listentime < minltime) minltime = listentime;
+    if(listentime > maxltime) maxltime = listentime;
+    if(listentime > MAXLOOPTIME) maxlcount++;
+
+    if(debugon)
     {
-      if(delta > MAXLOOPTIME)                                                             // delta is over reset timing loop
+      static unsigned long lastdistime = 0;
+      if((millis() - lastdistime) > DEBUGDELAY)
       {
-        if(!takentiming)                                                                  // new over limit occurance
-        {
-          maxovercount++;                                                                 // count each time goes over limit
-          takentiming = true;
-          errorState();                                                                   // set the error led, if max is too large
-        }
-        maxtimetaken = millis();                                                          // restart timer
+        lastdistime = millis();
+        Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d\n",
+          ((avertime > MAXLOOPTIME) || (maxtime > MAXLOOPTIME))?" too large":"", avertime, mintime, maxtime, maxcount);
+        Serial.printf("Display times%s: averd %lu, mind %lu, maxd %lu maxdcount %d\n",
+          ((averdtime > MAXLOOPTIME) || (maxdtime > MAXLOOPTIME))?" too large":"", averdtime, mindtime, maxdtime, maxdcount);
+        Serial.printf("Listen times%s: averl %lu, minl %lu, maxl %lu maxlcount %d\n",
+          ((averltime > MAXLOOPTIME) || (maxltime > MAXLOOPTIME))?" too large":"", averltime, minltime, maxltime, maxlcount);
       }
-      else if(takentiming && ((maxtimetaken - millis()) > MAXTIMEDELAY))                  // if delta is undert for last MAXTIMEDELAY
-      {
-        takentiming = false;
-        clearState();                                                                     // reset error led
-        if(debugon) Serial.printf("Loop times reset: aver %lu, min %lu, max %lu display %lu %lu\n", avertime, mintime, maxtime, displaytime, maxdtime);
-        maxtime = maxtime2;                                                               // reduce maxtime to under limit
-      }
-    }
-  }
-  if(debugon)
-  {
-    static unsigned long lastdistime = 0;
-    if((millis() - lastdistime) > DEBUGDELAY)
-    {
-      lastdistime = millis();
-      Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d display %lu %lu\n",
-        (!startc && ((avertime > MAXLOOPTIME) || (maxtime > MAXLOOPTIME)))?" too large":"", avertime, mintime, maxtime, maxovercount, displaytime, maxdtime);
     }
   }
 }
@@ -445,8 +438,14 @@ void UpdatePinInputs()
 
   for(int i = 0;i < PINPINSIZE;i++)
   {
-    if ((micros() - debtime[i]) > stoppedDelay)                                           // long delay since last change
+    unsigned long m = micros();
+    if(((m - debtime[i]) > stoppedDelay) && ((m - debtime[i]) < 2*stoppedDelay))          // if its been over a sec since last change, reset pulseperiod
+                                                                                          // checking less than 2 sec, to catch when debtime is updated by interrupt during this statement
+    {
+      if(debugon && pulseperiod[i])
+        Serial.printf("reset pulse %d %d %d %lu %lu %lu %d\n", i, pinstate[i], lastpinstate[i], m, debtime[i], averriseperiodtemp[i], pulseperiod[i]);
       pulseperiod[i] = 0;                                                                 // reset pulseperiod
+    }
   }
   AirAssistValveInput = !pinstate[AIRASSISTPIN];                                          // inverted debounced air assist input pin state
 
@@ -456,6 +455,10 @@ void UpdatePinInputs()
     static short pp[4];
     if(((aa != AirAssistValveInput) || (pp[0] != pulseperiod[0]) || (pp[1] != pulseperiod[1]) || (pp[2] != pulseperiod[2]) || (pp[3] != pulseperiod[3])))
     {
+//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 0, pinstate[0], lastpinstate[0], debtime[0], averriseperiodtemp[0]);
+//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 1, pinstate[1], lastpinstate[1], debtime[1], averriseperiodtemp[1]);
+//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 2, pinstate[2], lastpinstate[2], debtime[2], averriseperiodtemp[2]);
+//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 3, pinstate[3], lastpinstate[3], debtime[3], averriseperiodtemp[3]);     
       Serial.printf("Sensor %d %d %d %d %d\n", pulseperiod[0], pulseperiod[1], pulseperiod[2], pulseperiod[3], AirAssistValveInput);
       aa = AirAssistValveInput; pp[0] = pulseperiod[0]; pp[1] = pulseperiod[1]; pp[2] = pulseperiod[2]; pp[3] = pulseperiod[3];
       distime = millis();
@@ -472,22 +475,22 @@ void UpdateTempInputs()
   static short Currenttemp;
 
   Currenttemp = (Currenttemp*(LOWPASSFILTER-1) + analogRead(TEMP_PIN))/LOWPASSFILTER;     // low pass on temp
-  intempC = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);            // linear map of eblock/ADC to temp C * 10
-  intempF = (intempC * 9)/ 5 + 32*TEMP10;                                                 // standard translation of C to F, except temp * 10
+  intemp[1] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);          // linear map of eblock/ADC to temp C * 10
+  intemp[0] = (intemp[1] * 9)/ 5 + 32*TEMP10;                                             // standard translation of C to F, except temp * 10
 
   if(debugon && ((millis() - distime) > DEBUGDELAY))
   {
-    static byte F, C;
+    static short F, C;
     distime = millis();
-    if(((F != intempF) || (C != intempC)))
+    if(((F != intemp[0]) || (C != intemp[1])))
     {
-      Serial.printf("Temp Sensor %d %d\n", intempC, intempF);
-      F = intempF; C = intempC;
+      Serial.printf("Temp Sensor %d %d\n", intemp[1], intemp[0]);
+      F = intemp[0]; C = intemp[1];
     }
   }
 }
 
-#define TEMPOUTOFRANGE           ((intempC < MINTEMP) || (intempC > MAXTEMP))
+#define TEMPOUTOFRANGE           ((intemp[1] < MINTEMP) || (intemp[1] > MAXTEMP))
 #define PULSEOUTOFRANGE(i)       ((pulseperiod[i] < MINPULSEFREQ) || (pulseperiod[i] > MAXPULSEFREQ))
 /*
  *  Check whether we are cooling laser correctly and disable laser if there is a problem
@@ -533,50 +536,54 @@ void UpdateRelayState()
     }
 }
 
+#define ERRORBIT(x)   (1<<(x))
+unsigned long errorbits[] = {ERRORBIT(0), ERRORBIT(2), ERRORBIT(4), ERRORBIT(6), ERRORBIT(8), ERRORBIT(10), ERRORBIT(12), ERRORBIT(13), ERRORBIT(14), ERRORBIT(15), ERRORBIT(16) };
+char *ts[] = { "TempF", "TempC", "Pulse 0", "Pulse 1", "Pulse 2", "Pulse 3" };
+NexText *Text[] = { &TempF, &TempC, &c1, &c2, &c3, &c4 };
 /*
  *  Updating Display routines
  */
-#define CHECKTEMPDELTA(x, y)    (abs(x - y) > (2*TEMP10))                                 // 2 degrees
-
-bool UpdateTempDisplay(short *oldintemp, short intemp, NexText *Temp, char *s, unsigned long sret, unsigned long *rets)
+bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
 {
+  static unsigned int lasttime[6] = {0, 0, 0, 0, 0, 0};
   bool ret = false;
-
-  if(ret = CHECKTEMPDELTA(*oldintemp, intemp))
+  bool color;
+  if((millis() - lasttime[index]) > 1000)                                                 // slow down updates
   {
-    sprintf(buffer, "%d.%d", intemp/TEMP10, abs(intemp%TEMP10));
-    if(displayavailable)
+    if(index < 2)
     {
-      if(!Temp->setText(buffer)) *rets |= sret;
-      if(!Temp->Set_background_color_bco(TEMPOUTOFRANGE?RED:WHITE)) *rets |= (sret<<1);
+      ret = (oldintemp[index] != intemp[index]);
+      sprintf(buffer, "%d.%d", intemp[index]/TEMP10, abs(intemp[index]%TEMP10));
+      color = TEMPOUTOFRANGE;
     }
-    if(!*rets)
-      *oldintemp = intemp;                                                                // save state if updated display
-    if(debugon) Serial.printf("Display Temp%s '%s' %lx\n", s, buffer, *rets);
-  }
-  return ret;
-}
-
-#define CHECKPULSEDELTA(x, y)    (abs(x - y) > 50)                                        // 0.5 pulse/sec
-
-unsigned long UpdatePulseDisplay(int index, NexText *c, unsigned long sret, unsigned long *rets)
-{
-  bool ret = false;
-
-  if(ret = CHECKPULSEDELTA(oldpulseperiod[index], pulseperiod[index]))                    // update pulse freq if changed
-  {
-    if(pulseperiod[index])
-      sprintf(buffer, "%d.%d", pulseperiod[index]/PULSE100, pulseperiod[index]%PULSE100);
     else
-      strcpy(buffer, "stopped");
-    if(displayavailable)
     {
-      if(!c->setText(buffer)) *rets |= sret;
-      if(!c->Set_background_color_bco(PULSEOUTOFRANGE(index)?RED:WHITE)) *rets |= (sret<<1);
+      ret = (oldpulseperiod[index-2] != pulseperiod[index-2]);
+      if(pulseperiod[index-2])
+        sprintf(buffer, "%d.%d", pulseperiod[index-2]/PULSE100, pulseperiod[index-2]%PULSE100);
+      else
+        strcpy(buffer, "stopped");
+      color = PULSEOUTOFRANGE(index-2);
     }
-    if(!*rets)
-      oldpulseperiod[index] = pulseperiod[index];                                         // save state if updated display
-    if(debugon) Serial.printf("Display Pulse %d '%s' %lx\n", index, buffer, *rets);
+    if(ret)
+    {
+      if(displayavailable)
+      {
+        if(!Text[index]->setText(buffer)) *rets |= sret;
+        if(!Text[index]->Set_background_color_bco(color?RED:WHITE)) *rets |= (sret<<1);
+      }
+      if(!*rets)
+      {
+        if(index < 2)
+          oldintemp[index] = intemp[index];                                                 // save state if updated display temp
+        else
+          oldpulseperiod[index-2] = pulseperiod[index-2];                                   // save state if updated display pulse
+        lasttime[index] = millis();
+      }
+      if(debugon) Serial.printf("Display %s '%s' %lx\n", ts[index], buffer, *rets);
+    }
+    else
+      lasttime[index] = millis();
   }
   return ret;
 }
@@ -610,7 +617,6 @@ unsigned long UpdateDisplayButton(int index, unsigned long sret, unsigned long *
   return ret;
 }
 
-#define ERRORBIT(x)   (1<<(x))
 /*
  *  Make sure display reflects the state of the controller 
  *    Cycle round updating different parts of the UI but stop once updated 1 part or none to update
@@ -629,42 +635,25 @@ void UpdateDisplay()
     switch(part)                                                                          // break display updates up, 1 on each time round main loop
     {                                                                                     // keeps loop time down and doesn't flood display with too many commands
     case 0:
-      updateddisplay = UpdateTempDisplay(&oldintempF, intempF, &TempF, "F", ERRORBIT(0), &rets);// update temps if changed
-      break;
     case 1:
-      updateddisplay = UpdateTempDisplay(&oldintempC, intempC, &TempC, "C", ERRORBIT(2), &rets);
-      break;
     case 2:
-      updateddisplay = UpdatePulseDisplay(0, &c1, ERRORBIT(4), &rets);                    // update pulse freq if changed
-      break;
     case 3:
-      updateddisplay = UpdatePulseDisplay(1, &c2, ERRORBIT(6), &rets);
-      break;
     case 4:
-      updateddisplay = UpdatePulseDisplay(2, &c3, ERRORBIT(8), &rets);
-      break;
     case 5:
-      updateddisplay = UpdatePulseDisplay(3, &c4, ERRORBIT(10), &rets);
+      updateddisplay = UpdateTPDisplay(part, errorbits[part], &rets);                     // update temp/pulse if changed
       break;
     case 6:
-      updateddisplay = UpdateCoolDisplay(ERRORBIT(12), &rets);                            // update cooling state if changed
+      updateddisplay = UpdateCoolDisplay(errorbits[part], &rets);                         // update cooling state if changed
       break;
     case 7:
-      updateddisplay = UpdateDisplayButton(COOLBUTTON, ERRORBIT(13), &rets);              // update display buttons if changed
-      break;
     case 8:
-      updateddisplay = UpdateDisplayButton(EXHAUSTBUTTON, ERRORBIT(14), &rets);
-      break;
     case 9:
-      updateddisplay = UpdateDisplayButton(AIRASSISTBUTTON, ERRORBIT(15), &rets);
-      break;
     case 10:
-      updateddisplay = UpdateDisplayButton(LIGHTSBUTTON, ERRORBIT(16), &rets);
+      updateddisplay = UpdateDisplayButton(part-7, errorbits[part], &rets);               // update display buttons if changed
       break;
     }
     ++part %= 11;
-  } while(0);                                                                             // dont loop to reduce loop times due to display updates - check whether it is display that causes delay
-  //while(!updateddisplay && (startpart != part));                                        // loop until we have updated 1 UI part or tried them all
+  } while(!updateddisplay && (startpart != part));                                        // loop until we have updated 1 UI part or tried them all
   if(rets && debugon) Serial.printf("Display update failures %lx\n", rets);
   displaytime = micros() - displaytime;                                                   // display update time
 }
@@ -686,6 +675,8 @@ void loop()
     UpdateRelayState();                                                                   // Update relay state for buttons
   }
 
+  listentime = micros();
   nexLoop(nex_listen_list);                                                               // Get any button events from display
+  listentime = micros() - listentime;
   UpdateDisplay();                                                                        // Update display for current state
 }
