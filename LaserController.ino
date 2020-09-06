@@ -56,7 +56,8 @@ bool debugon = false;                                                           
 #define MAXTEMP       (27*TEMP10)                                                         // * 10     27C
 #define MINTEMP       (10*TEMP10)                                                         // * 10     10C
 
-#define LOWPASSFILTER 8
+#define TEMPLOWPASSFILTER   8
+#define PULSELOWPASSFILTER  4
 /* 
  *  digital input and temperature input values 
  */
@@ -107,7 +108,6 @@ const byte pinpin[] = { TIME_PIN0, TIME_PIN1, TIME_PIN2, TIME_PIN3, INPUT_PIN };
 #define PINPINSIZE              (sizeof(pinpin)/sizeof(pinpin[0]))
 #define AIRASSISTPIN            4                                                         // pinstate index for Air Assist pin state
                                                                                           // these are read/updated in interrupt handlers
-volatile byte lastpinstate[PINPINSIZE];                                                   // non-debounced pin state
 volatile byte pinstate[PINPINSIZE];                                                       // debounced pin state
 volatile unsigned long debtime[PINPINSIZE];                                               // time of last pin change for debounce
 volatile unsigned long risetime[PINPINSIZE];                                              // time of last debounced rising edge
@@ -221,31 +221,28 @@ void ButtonCallback(void *p)
 }
 
 /*
+ *      GRE    GFE    GRE    BFE  BRE GFE   BRE BFE GRE           Good/Bad Rising/Falling Edge
+ * c    1CDRU  0CDU   1CDRU  0C   1C  0CDU  1C  0C  1CDRU         cstate, Curtime, DebTime, Rising/Rising Period, Update Debtime
+ * p    0   1  1  0   0   1  1    1   1  0  0   0   0   1         pinstate
+*/
+/*
  *  Pulse input and air assist input pin interrupt handlers
  */
-void dointerrupt(int p)
+void dointerrupt(byte p)
 {
-  volatile byte cstate = digitalRead(pinpin[p]);                                          // current input value
-  volatile unsigned long curtime = micros();                                              // current time
-  if(lastpinstate[p] != cstate)                                                           // pin change, start debounce, shouldn't really need this test
-  {
-    volatile unsigned long dtime = debtime[p];                                            // last time pin changed
-    if ((curtime - dtime) > debounceDelay)                                                // pulse is valid
+  byte cstate = digitalRead(pinpin[p]);                                                   // current input value
+  unsigned long curtime = micros();                                                       // current time
+  if((pinstate[p] != cstate) && ((curtime - debtime[p]) > debounceDelay))                 // pin change, ignore changes unless debounce period from last change
+  {                                                                                       // will ignore frequencies > 1/debounce
+    if((cstate == HIGH) && (p != AIRASSISTPIN))                                           // pulse input is high calculate period of time from last rising edge
     {
-      if (lastpinstate[p] != pinstate[p])                                                 // debounced input has changed
-      {
-        pinstate[p] = lastpinstate[p];                                                    // saved debounced pin state
-        if((lastpinstate[p] == HIGH) && (p != AIRASSISTPIN))                              // pulse inputs calculate period of pulse
-        {
-          averriseperiodtemp[p] = (averriseperiodtemp[p]*(LOWPASSFILTER-1) + (dtime - risetime[p]))/LOWPASSFILTER;
-          risetime[p] = dtime;                                                            // time of last rising edge
-          if(averriseperiodtemp[p])
-            pulseperiod[p] = (1000000L*PULSE100)/averriseperiodtemp[p];                   // calculate pulses/sec * 100
-        }
-      }
+      averriseperiodtemp[p] = (averriseperiodtemp[p]*(PULSELOWPASSFILTER-1) + (curtime - risetime[p]))/PULSELOWPASSFILTER;
+      risetime[p] = curtime;                                                              // time of this rising edge for next time
+      if(averriseperiodtemp[p])
+        pulseperiod[p] = (1000000L*PULSE100)/averriseperiodtemp[p];                       // calculate pulses/sec * 100
     }
-    debtime[p] = curtime;                                                                 // save time and input state for debouncing
-    lastpinstate[p] = cstate;
+    debtime[p] = curtime;                                                                 // save time for debouncing next change - should be > debounce period from this change
+    pinstate[p] = cstate;                                                                 // save pin state
   }
 }
 
@@ -325,7 +322,7 @@ void setupSensors()
   for(int i = 0; i < PINPINSIZE; i++)
   {
     pinMode(pinpin[i], INPUT_PULLUP);                                                     // pulse in pins and air assist input pin
-    lastpinstate[i] = pinstate[i] = digitalRead(pinpin[i]);                               // init pin states
+    pinstate[i] = digitalRead(pinpin[i]);                                                 // init pin state
     debtime[i] = risetime[i] = micros();
     attachInterrupt(digitalPinToInterrupt(pinpin[i]), int_table[i], CHANGE);              // with interrupts
   }
@@ -373,8 +370,8 @@ void setup()
   setupRelays();                                                                          // relays
 }
 
-unsigned long displaytime;
-unsigned long listentime;
+#define NOLOOPTIME    7
+unsigned long looptime[NOLOOPTIME];
 #define MAXLOOPTIME     15000                                                             // max loop time in microseconds
 #define SKIPCOUNT       10                                                                // lots of initialization the first few times round loop
 /*
@@ -383,10 +380,9 @@ unsigned long listentime;
  */
 void MonitorTimingLoop()
 {
-  static int startc = SKIPCOUNT, maxcount = 0, maxdcount = 0, maxlcount = 0;
+  static int startc = SKIPCOUNT, maxcount = 0, maxlcount[NOLOOPTIME];
   static unsigned long avertime = 0, mintime = 0xffffffff, maxtime = 0, lastime = 0;
-  static unsigned long averdtime = 0, mindtime = 0xffffffff, maxdtime = 0;
-  static unsigned long averltime = 0, minltime = 0xffffffff, maxltime = 0;
+  static unsigned long averltime[NOLOOPTIME], minltime[NOLOOPTIME] = {0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff}, maxltime[NOLOOPTIME];
   unsigned long curtime = micros();
   unsigned long delta = curtime - lastime;
   lastime = curtime;
@@ -398,19 +394,17 @@ void MonitorTimingLoop()
   }
   else
   {
-    delta = (delta > (displaytime+listentime))?delta-(displaytime+listentime):delta;      // track display time separately
     avertime = (avertime + delta)/2;                                                      // track average, min and max loop times
     if(delta < mintime) mintime = delta;
     if(delta > maxtime) maxtime = delta;
     if(delta > MAXLOOPTIME) maxcount++;
-    averdtime = (averdtime + displaytime)/2;                                              // track average, min and max display times
-    if(displaytime < mindtime) mindtime = displaytime;
-    if(displaytime > maxdtime) maxdtime = displaytime;
-    if(displaytime > MAXLOOPTIME) maxdcount++;
-    averltime = (averltime + listentime)/2;                                               // track average, min and max display times
-    if(listentime < minltime) minltime = listentime;
-    if(listentime > maxltime) maxltime = listentime;
-    if(listentime > MAXLOOPTIME) maxlcount++;
+    for(int i =0; i < NOLOOPTIME; i++)
+    {
+      averltime[i] = (averltime[i] + looptime[i])/2;                                      // track average, min and max times for parts of loop
+      if(looptime[i] < minltime[i]) minltime[i] = looptime[i];
+      if(looptime[i] > maxltime[i]) maxltime[i] = looptime[i];
+      if(looptime[i] > MAXLOOPTIME) maxlcount[i]++;
+    }
 
     if(debugon)
     {
@@ -419,11 +413,10 @@ void MonitorTimingLoop()
       {
         lastdistime = millis();
         Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d\n",
-          ((avertime > MAXLOOPTIME) || (maxtime > MAXLOOPTIME))?" too large":"", avertime, mintime, maxtime, maxcount);
-        Serial.printf("Display times%s: averd %lu, mind %lu, maxd %lu maxdcount %d\n",
-          ((averdtime > MAXLOOPTIME) || (maxdtime > MAXLOOPTIME))?" too large":"", averdtime, mindtime, maxdtime, maxdcount);
-        Serial.printf("Listen times%s: averl %lu, minl %lu, maxl %lu maxlcount %d\n",
-          ((averltime > MAXLOOPTIME) || (maxltime > MAXLOOPTIME))?" too large":"", averltime, minltime, maxltime, maxlcount);
+          (maxtime > MAXLOOPTIME)?" too large":"", avertime, mintime, maxtime, maxcount);
+        for(int i =0; i < NOLOOPTIME; i++)
+          if(maxltime[i] > MAXLOOPTIME)
+            Serial.printf("loop times%d: averl %lu, minl %lu, maxl %lu maxlcount %d\n", i, averltime[i], minltime[i], maxltime[i], maxlcount[i]);
       }
     }
   }
@@ -439,11 +432,11 @@ void UpdatePinInputs()
   for(int i = 0;i < PINPINSIZE;i++)
   {
     unsigned long m = micros();
-    if(((m - debtime[i]) > stoppedDelay) && ((m - debtime[i]) < 2*stoppedDelay))          // if its been over a sec since last change, reset pulseperiod
-                                                                                          // checking less than 2 sec, to catch when debtime is updated by interrupt during this statement
+    unsigned long delta = m - debtime[i];                                                 // read into local variables in this order so make sure debtime isn't updated after micros() is called
+    if((delta > stoppedDelay) && (delta < 2*stoppedDelay))                                // if its been over a sec since last change, reset pulseperiod
     {
       if(debugon && pulseperiod[i])
-        Serial.printf("reset pulse %d %d %d %lu %lu %lu %d\n", i, pinstate[i], lastpinstate[i], m, debtime[i], averriseperiodtemp[i], pulseperiod[i]);
+        Serial.printf("reset pulse %d %d %lu %lu %lu %d\n", i, pinstate[i], m, debtime[i], averriseperiodtemp[i], pulseperiod[i]);
       pulseperiod[i] = 0;                                                                 // reset pulseperiod
     }
   }
@@ -455,10 +448,6 @@ void UpdatePinInputs()
     static short pp[4];
     if(((aa != AirAssistValveInput) || (pp[0] != pulseperiod[0]) || (pp[1] != pulseperiod[1]) || (pp[2] != pulseperiod[2]) || (pp[3] != pulseperiod[3])))
     {
-//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 0, pinstate[0], lastpinstate[0], debtime[0], averriseperiodtemp[0]);
-//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 1, pinstate[1], lastpinstate[1], debtime[1], averriseperiodtemp[1]);
-//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 2, pinstate[2], lastpinstate[2], debtime[2], averriseperiodtemp[2]);
-//      Serial.printf("rise %d ps %d lps %d dt %lu rise %lu\n", 3, pinstate[3], lastpinstate[3], debtime[3], averriseperiodtemp[3]);     
       Serial.printf("Sensor %d %d %d %d %d\n", pulseperiod[0], pulseperiod[1], pulseperiod[2], pulseperiod[3], AirAssistValveInput);
       aa = AirAssistValveInput; pp[0] = pulseperiod[0]; pp[1] = pulseperiod[1]; pp[2] = pulseperiod[2]; pp[3] = pulseperiod[3];
       distime = millis();
@@ -474,7 +463,7 @@ void UpdateTempInputs()
   static unsigned long distime;
   static short Currenttemp;
 
-  Currenttemp = (Currenttemp*(LOWPASSFILTER-1) + analogRead(TEMP_PIN))/LOWPASSFILTER;     // low pass on temp
+  Currenttemp = (Currenttemp*(TEMPLOWPASSFILTER-1) + analogRead(TEMP_PIN))/TEMPLOWPASSFILTER; // low pass on temp
   intemp[1] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);          // linear map of eblock/ADC to temp C * 10
   intemp[0] = (intemp[1] * 9)/ 5 + 32*TEMP10;                                             // standard translation of C to F, except temp * 10
 
@@ -629,7 +618,6 @@ void UpdateDisplay()
   int startpart = part;                                                                   // which UI part this call started from
   bool updateddisplay = false;                                                            // UI part updated
 
-  displaytime = micros();
   do
   {
     switch(part)                                                                          // break display updates up, 1 on each time round main loop
@@ -655,28 +643,39 @@ void UpdateDisplay()
     ++part %= 11;
   } while(!updateddisplay && (startpart != part));                                        // loop until we have updated 1 UI part or tried them all
   if(rets && debugon) Serial.printf("Display update failures %lx\n", rets);
-  displaytime = micros() - displaytime;                                                   // display update time
 }
 
 #define SensorDelay   100
+
+#define STARTTIME     temptime = micros()
+#define ENDTIME(i)    looptime[i] = micros() - temptime
 
 void loop()
 {
   MonitorTimingLoop();                                                                    // Monitor speed of this loop
   
   static unsigned long lastSensorTime;
+  unsigned long temptime;
+
+  STARTTIME;
   if((millis() - lastSensorTime) > SensorDelay)                                           // update sensors and controller state every SensorDelay milliseconds
   {
     UpdatePinInputs();                                                                    // Update digital pin inputs
+    ENDTIME(0); STARTTIME;
     UpdateTempInputs();                                                                   // Update temp input
-
+    ENDTIME(1); STARTTIME;
+    
     ValidateCoolingInputs();                                                              // Check if we have a cooling problem
+    ENDTIME(2); STARTTIME;
     UpdateAirAssistValve();                                                               // Enable air assist valve if requested
+    ENDTIME(3); STARTTIME;
     UpdateRelayState();                                                                   // Update relay state for buttons
+    ENDTIME(4); STARTTIME;
   }
 
-  listentime = micros();
   nexLoop(nex_listen_list);                                                               // Get any button events from display
-  listentime = micros() - listentime;
+  ENDTIME(5); STARTTIME;
+
   UpdateDisplay();                                                                        // Update display for current state
+  ENDTIME(6);
 }
