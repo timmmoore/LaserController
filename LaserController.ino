@@ -3,33 +3,37 @@
  * 1 input pin from Main Controller, high when wanting Air Assist - output 1 from AWC608 low run air assist, high stop air assist
  * 1 analog pin for water temperature
  * 
- * 1 Nextion display connected via serial port - need 1K resistor in Tx from Nextion
+ * 1 Seeeduino XIAO SAMD21 board 
+ * 
+ * 1 Nextion display (NX4827T043) connected via serial port - need 1K resistor inline with Tx from Nextion
  *    Shows - water temp in C and F
  *    Shows - speeds of water/fan/etc. sensors
  *    Shows 4 buttons, see above
  *    Shows state of Enable/Disable laser firing
  * 
- * 4 Buttons
+ * 4 Buttons on Nextion display
  *    Turn on/off Water Cooling
  *    Turn on/off Exhaust fan
  *    Turn on/off Air Assist pump
  *    Turn on/off internal light
  *    
- * 6 Relays connected via I2C to 2 boards (0x8, 0x6D)
- *    Turn on/off Water Cooling   - Connected to button, 110V AC
- *    Turn on/off Exhaust fan     - Connected to button, 110V AC
- *    Turn on/off Air Assist pump - Connected to button, 110V AC
- *    Turn on/off internal lights - Connected to button, 12V DC
- *    Open/close Air Assist valve - Open when pump off or pump on and main controller wants air assist, 24V DC
- *    Enable/Disable laser firing - Disable if Temp under/over and water/fan/etc pulse rate is under/over, 24V DC
+ * 6 Relays connected via I2C to 2 boards (0x8, 0x6D) (Sparkfun KIT-16833 and COM-16566)
+ *    R1: Turn on/off Water Cooling   - Connected to button, 110V AC
+ *    R2: Turn on/off Exhaust fan     - Connected to button, 110V AC
+ *    R3: Turn on/off Air Assist pump - Connected to button, 110V AC
+ *    R4: Not used
+ *    R5: Turn on/off internal lights - Connected to button, 12V DC
+ *    R6: Open/close Air Assist valve - Open when pump off or pump on and main controller wants air assist, 24V DC
+ *    R7: Enable/Disable laser firing - Disable if Temp under/over and water/fan/etc pulse rate is under/over, 24V DC
+ *    R8: Not used
  *
- *  D0-3  pulse input pins      To water flow, fan, etc sensors
- *  D4,5  I2C                   To relay boards
- *  D6,7  Serial1               To NexTion Display
+ *  D0-3  pulse input pins      Input from water flow, fan, etc sensors (0-200pps)
+ *  D4,5  I2C                   Output to relay boards
+ *  D6,7  Serial1               I/O to NexTion Display
  *  D8    Debug mode            Enable debug if low
- *  D9    Air assist input      To Main Controller output 1 (low active)
- *  A10   Temp input            Thermistor Temperature sensor via eblock
- *  D13   Error state led       Internal board LED used to show error state
+ *  D9    Air assist input      Input from Main Controller output 1 (low active)
+ *  A10   Temp input            Input from Thermistor Temperature sensor via eblock
+ *  D13   Error state led       Output internal board LED used to show error state
  *  
  */
 #include <Nextion.h>
@@ -370,7 +374,7 @@ void setup()
   setupRelays();                                                                          // relays
 }
 
-#define NOLOOPTIME    7
+#define NOLOOPTIME    8
 unsigned long looptime[NOLOOPTIME];
 #define MAXLOOPTIME     15000                                                             // max loop time in microseconds
 #define SKIPCOUNT       10                                                                // lots of initialization the first few times round loop
@@ -380,30 +384,21 @@ unsigned long looptime[NOLOOPTIME];
  */
 void MonitorTimingLoop()
 {
-  static int startc = SKIPCOUNT, maxcount = 0, maxlcount[NOLOOPTIME];
-  static unsigned long avertime = 0, mintime = 0xffffffff, maxtime = 0, lastime = 0;
-  static unsigned long averltime[NOLOOPTIME], minltime[NOLOOPTIME] = {0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff}, maxltime[NOLOOPTIME];
-  unsigned long curtime = micros();
-  unsigned long delta = curtime - lastime;
-  lastime = curtime;
+  static int startc = SKIPCOUNT, maxcount[NOLOOPTIME];
+  static unsigned long avertime[NOLOOPTIME], mintime[NOLOOPTIME] = {0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff}, maxtime[NOLOOPTIME];
 
   if(startc)                                                                              // skip average/min/max during initialization
   {
-    startc--;
-    if(!startc) avertime = delta;
+    if(!(--startc)) avertime[0] = looptime[0];
   }
   else
   {
-    avertime = (avertime + delta)/2;                                                      // track average, min and max loop times
-    if(delta < mintime) mintime = delta;
-    if(delta > maxtime) maxtime = delta;
-    if(delta > MAXLOOPTIME) maxcount++;
-    for(int i =0; i < NOLOOPTIME; i++)
+    for(int i = 0; i < NOLOOPTIME; i++)
     {
-      averltime[i] = (averltime[i] + looptime[i])/2;                                      // track average, min and max times for parts of loop
-      if(looptime[i] < minltime[i]) minltime[i] = looptime[i];
-      if(looptime[i] > maxltime[i]) maxltime[i] = looptime[i];
-      if(looptime[i] > MAXLOOPTIME) maxlcount[i]++;
+      avertime[i] = (avertime[i] + looptime[i])/2;                                        // track average, min and max times for parts of loop
+      if(looptime[i] < mintime[i]) mintime[i] = looptime[i];
+      if(looptime[i] > maxtime[i]) maxtime[i] = looptime[i];
+      if(looptime[i] > MAXLOOPTIME) maxcount[i]++;
     }
 
     if(debugon)
@@ -413,10 +408,10 @@ void MonitorTimingLoop()
       {
         lastdistime = millis();
         Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d\n",
-          (maxtime > MAXLOOPTIME)?" too large":"", avertime, mintime, maxtime, maxcount);
-        for(int i =0; i < NOLOOPTIME; i++)
-          if(maxltime[i] > MAXLOOPTIME)
-            Serial.printf("loop times%d: averl %lu, minl %lu, maxl %lu maxlcount %d\n", i, averltime[i], minltime[i], maxltime[i], maxlcount[i]);
+          (maxtime[0] > MAXLOOPTIME)?" too large":"", avertime[0], mintime[0], maxtime[0], maxcount[0]);
+        for(int i =1; i < NOLOOPTIME; i++)
+          if(maxtime[i] > MAXLOOPTIME)
+            Serial.printf("loop times%d: aver %lu, min %lu, max %lu maxcount %d\n", i, avertime[i], mintime[i], maxtime[i], maxcount[i]);
       }
     }
   }
@@ -429,14 +424,15 @@ void UpdatePinInputs()
 {
   static unsigned long distime;
 
-  for(int i = 0;i < PINPINSIZE;i++)
+  for(int i = 0;i < sizeof(pulseperiod)/sizeof(pulseperiod[0]);i++)
   {
+    unsigned long d = debtime[i];
     unsigned long m = micros();
-    unsigned long delta = m - debtime[i];                                                 // read into local variables in this order so make sure debtime isn't updated after micros() is called
+    unsigned long delta = m - d;                                                          // read into local variables in this order so make sure debtime isn't updated after micros() is called
     if((delta > stoppedDelay) && (delta < 2*stoppedDelay))                                // if its been over a sec since last change, reset pulseperiod
     {
       if(debugon && pulseperiod[i])
-        Serial.printf("reset pulse %d %d %lu %lu %lu %d\n", i, pinstate[i], m, debtime[i], averriseperiodtemp[i], pulseperiod[i]);
+        Serial.printf("reset pulse %d %d %lu %lu %lu %d\n", i, pinstate[i], m, d, averriseperiodtemp[i], pulseperiod[i]);
       pulseperiod[i] = 0;                                                                 // reset pulseperiod
     }
   }
@@ -461,20 +457,19 @@ void UpdatePinInputs()
 void UpdateTempInputs()
 {
   static unsigned long distime;
-  static short Currenttemp;
 
-  Currenttemp = (Currenttemp*(TEMPLOWPASSFILTER-1) + analogRead(TEMP_PIN))/TEMPLOWPASSFILTER; // low pass on temp
+  short Currenttemp = (Currenttemp*(TEMPLOWPASSFILTER-1) + analogRead(TEMP_PIN))/TEMPLOWPASSFILTER; // low pass on temp
   intemp[1] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);          // linear map of eblock/ADC to temp C * 10
   intemp[0] = (intemp[1] * 9)/ 5 + 32*TEMP10;                                             // standard translation of C to F, except temp * 10
 
   if(debugon && ((millis() - distime) > DEBUGDELAY))
   {
-    static short F, C;
+    static short T[2];
     distime = millis();
-    if(((F != intemp[0]) || (C != intemp[1])))
+    if((T[0] != intemp[0]) || (T[1] != intemp[1]))
     {
       Serial.printf("Temp Sensor %d %d\n", intemp[1], intemp[0]);
-      F = intemp[0]; C = intemp[1];
+      T[0] = intemp[0]; T[1] = intemp[1];
     }
   }
 }
@@ -525,6 +520,7 @@ void UpdateRelayState()
     }
 }
 
+#define UpdateDelay   1000
 #define ERRORBIT(x)   (1<<(x))
 unsigned long errorbits[] = {ERRORBIT(0), ERRORBIT(2), ERRORBIT(4), ERRORBIT(6), ERRORBIT(8), ERRORBIT(10), ERRORBIT(12), ERRORBIT(13), ERRORBIT(14), ERRORBIT(15), ERRORBIT(16) };
 char *ts[] = { "TempF", "TempC", "Pulse 0", "Pulse 1", "Pulse 2", "Pulse 3" };
@@ -537,21 +533,21 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
   static unsigned int lasttime[6] = {0, 0, 0, 0, 0, 0};
   bool ret = false;
   bool color;
-  if((millis() - lasttime[index]) > 1000)                                                 // slow down updates
+  if((millis() - lasttime[index]) > UpdateDelay)                                          // slow down updates
   {
     if(index < 2)
     {
       ret = (oldintemp[index] != intemp[index]);
-      sprintf(buffer, "%d.%d", intemp[index]/TEMP10, abs(intemp[index]%TEMP10));
+      sprintf(buffer, "%d.%d", intemp[index]/TEMP10, abs(intemp[index]%TEMP10));          // format for temperature
       color = TEMPOUTOFRANGE;
     }
     else
     {
       ret = (oldpulseperiod[index-2] != pulseperiod[index-2]);
       if(pulseperiod[index-2])
-        sprintf(buffer, "%d.%d", pulseperiod[index-2]/PULSE100, pulseperiod[index-2]%PULSE100);
+        sprintf(buffer, "%d.%d", pulseperiod[index-2]/PULSE100, pulseperiod[index-2]%PULSE100); // format for pulses
       else
-        strcpy(buffer, "stopped");
+        strcpy(buffer, "stopped");                                                        // no pules
       color = PULSEOUTOFRANGE(index-2);
     }
     if(ret)
@@ -564,9 +560,9 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
       if(!*rets)
       {
         if(index < 2)
-          oldintemp[index] = intemp[index];                                                 // save state if updated display temp
+          oldintemp[index] = intemp[index];                                               // save state if updated display temp
         else
-          oldpulseperiod[index-2] = pulseperiod[index-2];                                   // save state if updated display pulse
+          oldpulseperiod[index-2] = pulseperiod[index-2];                                 // save state if updated display pulse
         lasttime[index] = millis();
       }
       if(debugon) Serial.printf("Display %s '%s' %lx\n", ts[index], buffer, *rets);
@@ -622,21 +618,13 @@ void UpdateDisplay()
   {
     switch(part)                                                                          // break display updates up, 1 on each time round main loop
     {                                                                                     // keeps loop time down and doesn't flood display with too many commands
-    case 0:
-    case 1:
-    case 2:
-    case 3:
-    case 4:
-    case 5:
+    case 0: case 1: case 2: case 3: case 4: case 5:
       updateddisplay = UpdateTPDisplay(part, errorbits[part], &rets);                     // update temp/pulse if changed
       break;
     case 6:
       updateddisplay = UpdateCoolDisplay(errorbits[part], &rets);                         // update cooling state if changed
       break;
-    case 7:
-    case 8:
-    case 9:
-    case 10:
+    case 7: case 8: case 9: case 10:
       updateddisplay = UpdateDisplayButton(part-7, errorbits[part], &rets);               // update display buttons if changed
       break;
     }
@@ -647,35 +635,36 @@ void UpdateDisplay()
 
 #define SensorDelay   100
 
-#define STARTTIME     temptime = micros()
-#define ENDTIME(i)    looptime[i] = micros() - temptime
+#define STARTTIME(x)  temptime[x] = micros()
+#define ENDTIME(i,x)  looptime[i] = micros() - temptime[x]
 
 void loop()
 {
   MonitorTimingLoop();                                                                    // Monitor speed of this loop
   
   static unsigned long lastSensorTime;
-  unsigned long temptime;
+  unsigned long temptime[2];
 
-  STARTTIME;
+  STARTTIME(0); STARTTIME(1);
   if((millis() - lastSensorTime) > SensorDelay)                                           // update sensors and controller state every SensorDelay milliseconds
   {
     UpdatePinInputs();                                                                    // Update digital pin inputs
-    ENDTIME(0); STARTTIME;
+    ENDTIME(1,1); STARTTIME(1);
     UpdateTempInputs();                                                                   // Update temp input
-    ENDTIME(1); STARTTIME;
+    ENDTIME(2,1); STARTTIME(1);
     
     ValidateCoolingInputs();                                                              // Check if we have a cooling problem
-    ENDTIME(2); STARTTIME;
+    ENDTIME(3,1); STARTTIME(1);
     UpdateAirAssistValve();                                                               // Enable air assist valve if requested
-    ENDTIME(3); STARTTIME;
+    ENDTIME(4,1); STARTTIME(1);
     UpdateRelayState();                                                                   // Update relay state for buttons
-    ENDTIME(4); STARTTIME;
+    ENDTIME(5,1); STARTTIME(1);
   }
 
   nexLoop(nex_listen_list);                                                               // Get any button events from display
-  ENDTIME(5); STARTTIME;
+  ENDTIME(6,1); STARTTIME(1);
 
   UpdateDisplay();                                                                        // Update display for current state
-  ENDTIME(6);
+  ENDTIME(7,1);
+  ENDTIME(0,0);
 }
