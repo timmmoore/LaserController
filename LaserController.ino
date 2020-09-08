@@ -1,9 +1,9 @@
 /*
- * 4 input pins for water, fan, etc. should be pulsing > 5/sec < 20/sec
+ * 4 input pins for water, fan, etc. should be pulsing > 5/sec < 50/sec
  * 1 input pin from Main Controller, high when wanting Air Assist - output 1 from AWC608 low run air assist, high stop air assist
  * 1 analog pin for water temperature
  * 
- * 1 Seeeduino XIAO SAMD21 board 
+ * 1 Seeeduino XIAO SAMD21 board 256K flash, 32K RAM
  * 
  * 1 Nextion display (NX4827T043) connected via serial port - need 1K resistor inline with Tx from Nextion
  *    Shows - water temp in C and F
@@ -32,55 +32,64 @@
  *  D6,7  Serial1               I/O to NexTion Display
  *  D8    Debug mode            Enable debug if low
  *  D9    Air assist input      Input from Main Controller output 1 (low active)
- *  A10   Temp input            Input from Thermistor Temperature sensor via eblock
+ *  A10   Temperature input     Input from Thermistor Temperature sensor via eblock
  *  D13   Error state led       Output internal board LED used to show error state
  *  
+ *  Uses modified Nextion library - adds setting background color and makes serial I/O better
+ *  Uses modified wiring_analog.c to fix known issue with SAMD21 analog read - not fixed in Seeedstudio version
+ *  
  */
-#include <Nextion.h>
 #include "NexButton.h"
 #include "NexText.h"
 
-#include <Wire.h>
 #include <SparkFun_Qwiic_Relay.h>
 
-bool debugon = false;                                                                     // debug off by default
-#define DEBUGON_PIN   8                                                                   // if pin low, debugon is set to true
-#define DEBUGDELAY    1000                                                                // delay between debug outputs
 /*
  * pulse in limits
  */
-#define PULSE100      100
-#define MAXPULSEFREQ  (50*PULSE100)                                                       // * 100    50/sec
-#define MINPULSEFREQ  (5*PULSE100)                                                        // * 100     5/sec
+#define PULSE100      100                                                                 // pulses is stored as *100
+#define MAXPULSEFREQ  (50*PULSE100)                                                       // * 100    50/sec  - top of pps range
+#define MINPULSEFREQ  (5*PULSE100)                                                        // * 100     5/sec  - bottom of pps range
 
 /*
  * temperature limits
  */
-#define TEMP10        10
-#define MAXTEMP       (27*TEMP10)                                                         // * 10     27C
-#define MINTEMP       (10*TEMP10)                                                         // * 10     10C
+#define TEMP10        10                                                                  // temp is stored as *10
+#define MAXTEMP       (27*TEMP10)                                                         // * 10     27C   top of temp range
+#define MINTEMP       (10*TEMP10)                                                         // * 10     10C - bottom of temp range
 
-#define TEMPLOWPASSFILTER   8
-#define PULSELOWPASSFILTER  4
+/*
+ *  Sensor filtering
+ */
+#define TEMPLOWPASSFILTER   8                                                             // low pass filter on temperature analogRead
+#define PULSELOWPASSFILTER  4                                                             // low pass filter on pulse periods
+
 /* 
  *  digital input and temperature input values 
  */
-bool AirAssistValveInput = true;
-short intemp[2];
-volatile unsigned short pulseperiod[4];
+bool AirAssistValveInput = true;                                                          // Air assist input from Main Controller
+short intemp[2];                                                                          // Temperatures F and C
+volatile unsigned short pulseperiod[4];                                                   // input pulses/sec, output from interrupt handlers
 
 /* 
- *  last UI values - save updating UI except when needed 
+ *  last UI values - save updating UI except when needed
  */
-unsigned short oldpulseperiod[4];
-short oldintemp[2];
 bool oldCurrent_Cool_State;
+short oldintemp[2];
+unsigned short oldpulseperiod[4];
 
 /* 
  *  Controller state 
  */
-bool Air_Valve;                                                                           // Air Assist valve on/off
 bool Current_Cool_State;                                                                  // Laser disabled state on/off
+bool Air_Valve;                                                                           // Air Assist valve on/off
+
+/*
+ *  Debug State
+ */
+bool debugon = false;                                                                     // debug off by default
+#define DEBUGDELAY              1000                                                      // delay between debug outputs
+#define DEBUGON_PIN             8                                                         // if pin low, debugon is set to true
 
 /*
  * LED to show error state on initialization
@@ -89,11 +98,11 @@ bool Current_Cool_State;                                                        
 #define LED_OFF                 HIGH
 #define LED_ON                  LOW
 
-void errorState() { digitalWrite(LED_PIN, LED_ON); }
-void clearState() { digitalWrite(LED_PIN, LED_OFF); }
+#define errorState digitalWrite(LED_PIN, LED_ON)
+#define clearState digitalWrite(LED_PIN, LED_OFF)
 
 /* 
- *  local sensor information 
+ *  local sensor information and state 
  */
 #define  TIME_PIN0               0                                                        // pulse in pins
 #define  TIME_PIN1               1
@@ -102,8 +111,8 @@ void clearState() { digitalWrite(LED_PIN, LED_OFF); }
 #define  INPUT_PIN               9                                                        // digital input pin
 #define  TEMP_PIN                A10                                                      // eblock/temp in pin
 
-#define ANALOGRESOLUTION  ADC_RESOLUTION                                                  // ADC resolution
-#define ANALOGRANGEMAX    ((1<<ANALOGRESOLUTION)-1)                                       // max value of ADC
+#define ANALOGRESOLUTION         ADC_RESOLUTION                                           // ADC resolution
+#define ANALOGRANGEMAX           ((1<<ANALOGRESOLUTION)-1)                                // max value of ADC
 
 const unsigned long debounceDelay = 5000;                                                 // the debounce time (us), max freq 100/sec
 const unsigned long stoppedDelay = 1000000;                                               // after 1sec without any pin state changes, set to 0 pulses/sec
@@ -111,7 +120,10 @@ const byte pinpin[] = { TIME_PIN0, TIME_PIN1, TIME_PIN2, TIME_PIN3, INPUT_PIN };
 
 #define PINPINSIZE              (sizeof(pinpin)/sizeof(pinpin[0]))
 #define AIRASSISTPIN            4                                                         // pinstate index for Air Assist pin state
-                                                                                          // these are read/updated in interrupt handlers
+
+/*
+ * these variables are read/updated in interrupt handlers 
+ */
 volatile byte pinstate[PINPINSIZE];                                                       // debounced pin state
 volatile unsigned long debtime[PINPINSIZE];                                               // time of last pin change for debounce
 volatile unsigned long risetime[PINPINSIZE];                                              // time of last debounced rising edge
@@ -123,11 +135,17 @@ volatile unsigned long averriseperiodtemp[PINPINSIZE];                          
 bool displayavailable = false;                                                            // whether we found display correctly
 const int displayStartupDelay = 500;                                                      // delay for display to initialize
 
-#define RED     63488                                                                     // UI colors
+/*
+ *  UI colors
+ */
+#define RED     63488
 #define GREEN    2016
 #define WHITE   65535
 #define GREY    50712
-                                                                                          // UI elements
+
+/*
+ *  UI elements
+ */
 NexButton CoolOn = NexButton(0, 6, "CoolOn");                                             // Buttons to enable/disable water/exhaust/etc.
 NexButton ExhaustOn = NexButton(0, 7, "ExhaustOn");
 NexButton AirOn = NexButton(0, 8, "AirOn");
@@ -142,9 +160,10 @@ NexText CoolingOK = NexText(0, 10, "CoolingOK");                                
 NexText tempTextF = NexText(0, 11, "tempTextF");                                          // static text
 NexText tempTextC = NexText(0, 12, "tempTextC");
 
-char buffer[20];                                                                          // int to text buffer used to update text in display
-
-NexTouch *nex_listen_list[] =                                                             // UI buttons for callbacks
+/*
+ *  UI buttons for callbacks
+ */
+NexTouch *nex_listen_list[] =
 {
     &CoolOn,
     &ExhaustOn,
@@ -154,7 +173,7 @@ NexTouch *nex_listen_list[] =                                                   
 };
 
 /*
- *  Relays information
+ *  Relay information
  */
 #define I2CCLOCK              400000                                                      // 400K clock
 
@@ -183,6 +202,9 @@ struct {
 #define GETBOARD(r) ((r-1)/4)                                                             // relay no to relay board
 #define GETRELAY(r) (((r-1)%4)+1)                                                         // relay no to relay on board
 
+/*
+ *  Turn relay on/off
+ */
 void SetRelay(int relay, bool value)
 {
   int b = GETBOARD(relay);                                                                // which relay board
@@ -195,28 +217,32 @@ void SetRelay(int relay, bool value)
   }
 }
 
-#define COOLBUTTON      0                                                                 // button indexes
+/*
+ *  Button information and state
+ */
+#define COOLBUTTON      0                                                                 // button indexes in ButtonState array
 #define EXHAUSTBUTTON   1
 #define AIRASSISTBUTTON 2
 #define LIGHTSBUTTON    3
 
 #define BUTTONSTATESIZE   (sizeof(ButtonState)/sizeof(ButtonState[0]))
 #define BUTTONINDEX(p)    (p-ButtonState)
-/*
- *  Button callback handlers
- */
+
 struct _ButtonState
 {
-  bool state;
-  bool oldstate;
-  int relay;
-  bool relaystate;
-  NexButton *Button;
+  bool state;                                                                             // current state
+  bool oldstate;                                                                          // UI state
+  int relay;                                                                              // relay to toggle if configured
+  bool relaystate;                                                                        // current relay state
+  NexButton *Button;                                                                      // Button for this configuration
 } ButtonState[] = { { false, true, RELAY_COOL, false, &CoolOn },
                     { false, true, RELAY_EXHAUST, false, &ExhaustOn },
                     { false, true, RELAY_AIRASSISTPUMP, false, &AirOn },
                     { false, true, RELAY_LIGHTS, false, &LightsOn } };
 
+/*
+ *  Button callback handlers
+ */
 void ButtonCallback(void *p)
 {
   struct _ButtonState *ptr = (struct _ButtonState *)p;
@@ -225,20 +251,20 @@ void ButtonCallback(void *p)
 }
 
 /*
+ *  Pulse input and air assist input pin interrupt handlers
+ */
+/*
  *      GRE    GFE    GRE    BFE  BRE GFE   BRE BFE GRE           Good/Bad Rising/Falling Edge
  * c    1CDRU  0CDU   1CDRU  0C   1C  0CDU  1C  0C  1CDRU         cstate, Curtime, DebTime, Rising/Rising Period, Update Debtime
  * p    0   1  1  0   0   1  1    1   1  0  0   0   0   1         pinstate
-*/
-/*
- *  Pulse input and air assist input pin interrupt handlers
  */
 void dointerrupt(byte p)
 {
   byte cstate = digitalRead(pinpin[p]);                                                   // current input value
   unsigned long curtime = micros();                                                       // current time
   if((pinstate[p] != cstate) && ((curtime - debtime[p]) > debounceDelay))                 // pin change, ignore changes unless debounce period from last change
-  {                                                                                       // will ignore frequencies > 1/debounce
-    if((cstate == HIGH) && (p != AIRASSISTPIN))                                           // pulse input is high calculate period of time from last rising edge
+  {                                                                                       // note will ignore frequencies > 1/debounce
+    if((cstate == HIGH) && (p != AIRASSISTPIN))                                           // if pulse input is high calculate period of time from last rising edge except for air assist pin
     {
       averriseperiodtemp[p] = (averriseperiodtemp[p]*(PULSELOWPASSFILTER-1) + (curtime - risetime[p]))/PULSELOWPASSFILTER;
       risetime[p] = curtime;                                                              // time of this rising edge for next time
@@ -246,7 +272,7 @@ void dointerrupt(byte p)
         pulseperiod[p] = (1000000L*PULSE100)/averriseperiodtemp[p];                       // calculate pulses/sec * 100
     }
     debtime[p] = curtime;                                                                 // save time for debouncing next change - should be > debounce period from this change
-    pinstate[p] = cstate;                                                                 // save pin state
+    pinstate[p] = cstate;                                                                 // save debounced pin state
   }
 }
 
@@ -262,8 +288,8 @@ void edgeinterrupti() { dointerrupt(AIRASSISTPIN); }                            
 void setupDebug()
 {
   Serial.begin(115200);                                                                   // serial debug
-  pinMode(DEBUGON_PIN,INPUT_PULLUP);                                                      // input pin to override debug mode
-  debugon = !digitalRead(DEBUGON_PIN);                                                    // if low make sure debug mode is on, otherwise the default in the code
+  pinMode(DEBUGON_PIN, INPUT_PULLUP);                                                     // input pin to override debug mode
+  if(!digitalRead(DEBUGON_PIN)) debugon = true;                                           // if low make sure debug mode is on, otherwise the default in the code
   if(debugon)
   {
     while(!Serial);                                                                       // wait until we have a monitor on the usb serial port
@@ -277,7 +303,7 @@ void setupDebug()
 void setupLED()
 {
   pinMode(LED_PIN,OUTPUT);                                                                // setup LED pin
-  digitalWrite(LED_PIN, LED_OFF);                                                         // LED off
+  clearState;                                                                             // LED off
 }
 
 /*
@@ -295,7 +321,7 @@ void setupDisplay()
     if(!(displayavailable = nexInit(115200)))                                             // retry init display
     {
       if(debugon) Serial.printf("Check connections to Nextion Display\n");
-      errorState();                                                                       // set the error led, we have a problem
+      errorState;                                                                         // set the error led, we have a problem
     }
   }
   for(int i = 0; i < BUTTONSTATESIZE; i++)
@@ -321,23 +347,26 @@ void setupSensors()
 {
   if(debugon) Serial.printf("SetupSensors\n");
 
-  analogReadResolution(ANALOGRESOLUTION);                                                 // setup temp analog pin
+  analogReadResolution(ANALOGRESOLUTION);                                                 // setup temperature analog pin
 
   for(int i = 0; i < PINPINSIZE; i++)
   {
     pinMode(pinpin[i], INPUT_PULLUP);                                                     // pulse in pins and air assist input pin
-    pinstate[i] = digitalRead(pinpin[i]);                                                 // init pin state
-    debtime[i] = risetime[i] = micros();
-    attachInterrupt(digitalPinToInterrupt(pinpin[i]), int_table[i], CHANGE);              // with interrupts
+    pinstate[i] = digitalRead(pinpin[i]);                                                 // initialize pin state
+    debtime[i] = risetime[i] = micros();                                                  // initialize timers
+    attachInterrupt(digitalPinToInterrupt(pinpin[i]), int_table[i], CHANGE);              // interrupts on each pin
   }
 }
 
+/*
+ *  Initialize relay board
+ */
 void initRelay(int r)
 {
   if(!(relays[r].relayavailable = relays[r].relay->begin()))                              // init relay board and check its available
   {
     if(debugon) Serial.printf("Check connections to Qwiic Relay%d\n", r+1);
-    errorState();                                                                         // set the error led, we failed to find one of the relay boards
+    errorState;                                                                           // set the error led, we failed to find one of the relay boards
   }
   else
   {
@@ -349,9 +378,6 @@ void initRelay(int r)
   }
 }
 
-/*
- * Initialize the 2 relay boards
- */
 void setupRelays()
 {
   if(debugon) Serial.printf("SetupRelays\n");
@@ -359,6 +385,9 @@ void setupRelays()
   initRelay(1);
 }
 
+/*
+ *  Setup everything
+ */
 void setup()
 {
   setupDebug();                                                                           // check if debug is on and init debug serial port
@@ -374,22 +403,25 @@ void setup()
   setupRelays();                                                                          // relays
 }
 
+/*
+ *  Monitor timing of main loop and error if too large. Loop times are < 8-9ms, most are < 1ms
+ *   Most of the delay is when updating the display, non display times < 1ms
+ */
 #define NOLOOPTIME    8
-unsigned long looptime[NOLOOPTIME];
+unsigned long looptime[NOLOOPTIME];                                                       // timing of main loop and parts of loop
 #define MAXLOOPTIME     15000                                                             // max loop time in microseconds
 #define SKIPCOUNT       10                                                                // lots of initialization the first few times round loop
-/*
- * Monitor timing of main loop and error if too large. Loop times are < 7-8ms and most are < 1ms
- *  Most of the delay is when updating the display, non display times < 1ms
- */
+
 void MonitorTimingLoop()
 {
   static int startc = SKIPCOUNT, maxcount[NOLOOPTIME];
-  static unsigned long avertime[NOLOOPTIME], mintime[NOLOOPTIME] = {0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff,0xffffffff}, maxtime[NOLOOPTIME];
+  static unsigned long avertime[NOLOOPTIME], mintime[NOLOOPTIME], maxtime[NOLOOPTIME];
 
   if(startc)                                                                              // skip average/min/max during initialization
   {
-    if(!(--startc)) avertime[0] = looptime[0];
+    if(!(--startc))
+      for(int i = 0; i < NOLOOPTIME; i++)
+        avertime[i] = mintime[i] = maxtime[i] = looptime[i];                              // initialize everything on last skip
   }
   else
   {
@@ -409,7 +441,7 @@ void MonitorTimingLoop()
         lastdistime = millis();
         Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d\n",
           (maxtime[0] > MAXLOOPTIME)?" too large":"", avertime[0], mintime[0], maxtime[0], maxcount[0]);
-        for(int i =1; i < NOLOOPTIME; i++)
+        for(int i = 1; i < NOLOOPTIME; i++)
           if(maxtime[i] > MAXLOOPTIME)
             Serial.printf("loop times%d: aver %lu, min %lu, max %lu maxcount %d\n", i, avertime[i], mintime[i], maxtime[i], maxcount[i]);
       }
@@ -418,13 +450,13 @@ void MonitorTimingLoop()
 }
 
 /*
- *  get sensor values from pulse input sensor, air assist input sensor and temp sensor and translate them into usable values
+ *  get sensor values from pulse, air assist input interrupt state and translate them into useful state
  */
 void UpdatePinInputs()
 {
   static unsigned long distime;
 
-  for(int i = 0;i < sizeof(pulseperiod)/sizeof(pulseperiod[0]);i++)
+  for(int i = 0;i < sizeof(pulseperiod)/sizeof(pulseperiod[0]);i++)                       // note using size of pulseperiod because that will be reset and its smaller than other interrupt arrays
   {
     unsigned long d = debtime[i];
     unsigned long m = micros();
@@ -451,6 +483,9 @@ void UpdatePinInputs()
   }
 }
 
+/*
+ *  get temp sensor value and translate it into actual temperatures
+ */
 #define MINEBLOCKTEMP   (-22*TEMP10)
 #define MAXEBLOCKTEMP   (56*TEMP10)
 
@@ -458,7 +493,7 @@ void UpdateTempInputs()
 {
   static unsigned long distime;
 
-  short Currenttemp = (Currenttemp*(TEMPLOWPASSFILTER-1) + analogRead(TEMP_PIN))/TEMPLOWPASSFILTER; // low pass on temp
+  short Currenttemp = (Currenttemp*(TEMPLOWPASSFILTER-1) + analogRead(TEMP_PIN))/TEMPLOWPASSFILTER; // analogRead should take ~9.5us, low pass on temp
   intemp[1] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);          // linear map of eblock/ADC to temp C * 10
   intemp[0] = (intemp[1] * 9)/ 5 + 32*TEMP10;                                             // standard translation of C to F, except temp * 10
 
@@ -474,11 +509,12 @@ void UpdateTempInputs()
   }
 }
 
-#define TEMPOUTOFRANGE           ((intemp[1] < MINTEMP) || (intemp[1] > MAXTEMP))
-#define PULSEOUTOFRANGE(i)       ((pulseperiod[i] < MINPULSEFREQ) || (pulseperiod[i] > MAXPULSEFREQ))
 /*
  *  Check whether we are cooling laser correctly and disable laser if there is a problem
  */
+#define TEMPOUTOFRANGE           ((intemp[1] < MINTEMP) || (intemp[1] > MAXTEMP))
+#define PULSEOUTOFRANGE(i)       ((pulseperiod[i] < MINPULSEFREQ) || (pulseperiod[i] > MAXPULSEFREQ))
+
 void ValidateCoolingInputs()
 {
                                                                                           // if one of the cooling fans, pump, water flow sensor is bad
@@ -494,7 +530,7 @@ void ValidateCoolingInputs()
 }
 
 /*
- * Calculate air assist valve state
+ *  Calculate air assist valve state
  */
 void UpdateAirAssistValve()
 {
@@ -508,7 +544,7 @@ void UpdateAirAssistValve()
 }
 
 /*
- * Update relay state to match button state
+ *  Update relay state to match button state
  */
 void UpdateRelayState()
 {
@@ -520,14 +556,16 @@ void UpdateRelayState()
     }
 }
 
+/*
+ *  Updating Display routines
+ */
 #define UpdateDelay   1000
 #define ERRORBIT(x)   (1<<(x))
 unsigned long errorbits[] = {ERRORBIT(0), ERRORBIT(2), ERRORBIT(4), ERRORBIT(6), ERRORBIT(8), ERRORBIT(10), ERRORBIT(12), ERRORBIT(13), ERRORBIT(14), ERRORBIT(15), ERRORBIT(16) };
 char *ts[] = { "TempF", "TempC", "Pulse 0", "Pulse 1", "Pulse 2", "Pulse 3" };
 NexText *Text[] = { &TempF, &TempC, &c1, &c2, &c3, &c4 };
-/*
- *  Updating Display routines
- */
+char displaybuffer[20];                                                                   // int to text buffer used to update text in display
+
 bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
 {
   static unsigned int lasttime[6] = {0, 0, 0, 0, 0, 0};
@@ -537,24 +575,24 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
   {
     if(index < 2)
     {
-      ret = (oldintemp[index] != intemp[index]);
-      sprintf(buffer, "%d.%d", intemp[index]/TEMP10, abs(intemp[index]%TEMP10));          // format for temperature
+      ret = (oldintemp[index] != intemp[index]);                                          // temperature changed
+      sprintf(displaybuffer, "%d.%d", intemp[index]/TEMP10, abs(intemp[index]%TEMP10));   // format for temperature
       color = TEMPOUTOFRANGE;
     }
     else
     {
-      ret = (oldpulseperiod[index-2] != pulseperiod[index-2]);
+      ret = (oldpulseperiod[index-2] != pulseperiod[index-2]);                            // pps changed
       if(pulseperiod[index-2])
-        sprintf(buffer, "%d.%d", pulseperiod[index-2]/PULSE100, pulseperiod[index-2]%PULSE100); // format for pulses
+        sprintf(displaybuffer, "%d.%d", pulseperiod[index-2]/PULSE100, pulseperiod[index-2]%PULSE100); // format for pulses
       else
-        strcpy(buffer, "stopped");                                                        // no pules
+        strcpy(displaybuffer, "stopped");                                                 // no pulses
       color = PULSEOUTOFRANGE(index-2);
     }
-    if(ret)
+    if(ret)                                                                               // we have an update to do
     {
       if(displayavailable)
       {
-        if(!Text[index]->setText(buffer)) *rets |= sret;
+        if(!Text[index]->setText(displaybuffer)) *rets |= sret;
         if(!Text[index]->Set_background_color_bco(color?RED:WHITE)) *rets |= (sret<<1);
       }
       if(!*rets)
@@ -565,7 +603,7 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
           oldpulseperiod[index-2] = pulseperiod[index-2];                                 // save state if updated display pulse
         lasttime[index] = millis();
       }
-      if(debugon) Serial.printf("Display %s '%s' %lx\n", ts[index], buffer, *rets);
+      if(debugon) Serial.printf("Display %s '%s' %lx\n", ts[index], displaybuffer, *rets);
     }
     else
       lasttime[index] = millis();
@@ -605,7 +643,7 @@ unsigned long UpdateDisplayButton(int index, unsigned long sret, unsigned long *
 /*
  *  Make sure display reflects the state of the controller 
  *    Cycle round updating different parts of the UI but stop once updated 1 part or none to update
- *    Dont update state unless display acks correctly, will retry later if state hasn't been updated
+ *    Dont update state unless display acks correctly, will retry later since state hasn't been updated
  */
 void UpdateDisplay()
 {
@@ -628,24 +666,27 @@ void UpdateDisplay()
       updateddisplay = UpdateDisplayButton(part-7, errorbits[part], &rets);               // update display buttons if changed
       break;
     }
-    ++part %= 11;
-  } while(!updateddisplay && (startpart != part));                                        // loop until we have updated 1 UI part or tried them all
+    ++part %= 11;                                                                         // round robin the 11 parts of display
+  } while(!updateddisplay && (startpart != part));                                        // loop until we have tried updating 1 UI part or none needing updating
   if(rets && debugon) Serial.printf("Display update failures %lx\n", rets);
 }
 
+/*
+ *  Main loop
+ */
 #define SensorDelay   100
 
-#define STARTTIME(x)  temptime[x] = micros()
-#define ENDTIME(i,x)  looptime[i] = micros() - temptime[x]
+#define STARTTIME(x)  temptime[x] = micros()                                              // start time of measurement
+#define ENDTIME(i,x)  looptime[i] = micros() - temptime[x]                                // end time of measurement
 
 void loop()
 {
-  MonitorTimingLoop();                                                                    // Monitor speed of this loop
-  
   static unsigned long lastSensorTime;
   unsigned long temptime[2];
 
-  STARTTIME(0); STARTTIME(1);
+  MonitorTimingLoop();                                                                    // Monitor speed of this loop
+
+  STARTTIME(0); STARTTIME(1);                                                             // time main loop and each part of the loop
   if((millis() - lastSensorTime) > SensorDelay)                                           // update sensors and controller state every SensorDelay milliseconds
   {
     UpdatePinInputs();                                                                    // Update digital pin inputs
