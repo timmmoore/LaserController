@@ -64,6 +64,8 @@
 #define TEMPLOWPASSFILTER   8                                                             // low pass filter on temperature analogRead
 #define PULSELOWPASSFILTER  4                                                             // low pass filter on pulse periods
 
+#define TEMPINDEXF          0                                                             // Temp F
+#define TEMPINDEXC          1                                                             // Temp C
 /* 
  *  digital input and temperature input values 
  */
@@ -494,17 +496,17 @@ void UpdateTempInputs()
   static unsigned long distime;
 
   short Currenttemp = (Currenttemp*(TEMPLOWPASSFILTER-1) + analogRead(TEMP_PIN))/TEMPLOWPASSFILTER; // analogRead should take ~9.5us, low pass on temp
-  intemp[1] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);          // linear map of eblock/ADC to temp C * 10
-  intemp[0] = (intemp[1] * 9)/ 5 + 32*TEMP10;                                             // standard translation of C to F, except temp * 10
+  intemp[TEMPINDEXC] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);           // linear map of eblock/ADC to temp C * 10
+  intemp[TEMPINDEXF] = (intemp[TEMPINDEXC] * 9)/ 5 + 32*TEMP10;                                     // standard translation of C to F, except temp * 10
 
   if(debugon && ((millis() - distime) > DEBUGDELAY))
   {
     static short T[2];
     distime = millis();
-    if((T[0] != intemp[0]) || (T[1] != intemp[1]))
+    if((T[TEMPINDEXF] != intemp[TEMPINDEXF]) || (T[TEMPINDEXC] != intemp[TEMPINDEXC]))
     {
-      Serial.printf("Temp Sensor %d %d\n", intemp[1], intemp[0]);
-      T[0] = intemp[0]; T[1] = intemp[1];
+      Serial.printf("Temp Sensor %d %d\n", intemp[TEMPINDEXC], intemp[TEMPINDEXF]);
+      T[TEMPINDEXF] = intemp[TEMPINDEXF]; T[TEMPINDEXC] = intemp[TEMPINDEXC];
     }
   }
 }
@@ -512,7 +514,7 @@ void UpdateTempInputs()
 /*
  *  Check whether we are cooling laser correctly and disable laser if there is a problem
  */
-#define TEMPOUTOFRANGE           ((intemp[1] < MINTEMP) || (intemp[1] > MAXTEMP))
+#define TEMPOUTOFRANGE           ((intemp[TEMPINDEXC] < MINTEMP) || (intemp[TEMPINDEXC] > MAXTEMP))
 #define PULSEOUTOFRANGE(i)       ((pulseperiod[i] < MINPULSEFREQ) || (pulseperiod[i] > MAXPULSEFREQ))
 
 void ValidateCoolingInputs()
@@ -573,7 +575,7 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
   bool color;
   if((millis() - lasttime[index]) > UpdateDelay)                                          // slow down updates
   {
-    if(index < 2)
+    if(index <= TEMPINDEXC)
     {
       ret = (oldintemp[index] != intemp[index]);                                          // temperature changed
       sprintf(displaybuffer, "%d.%d", intemp[index]/TEMP10, abs(intemp[index]%TEMP10));   // format for temperature
@@ -656,7 +658,7 @@ void UpdateDisplay()
   {
     switch(part)                                                                          // break display updates up, 1 on each time round main loop
     {                                                                                     // keeps loop time down and doesn't flood display with too many commands
-    case 0: case 1: case 2: case 3: case 4: case 5:
+    case 0: case 1: case 2: case 3: case 4: case 5:                                       // 0: TEMPINDEXF, 1: TEMPINDEXC, 2-5: pulse index 0-3
       updateddisplay = UpdateTPDisplay(part, errorbits[part], &rets);                     // update temp/pulse if changed
       break;
     case 6:
