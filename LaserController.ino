@@ -87,6 +87,11 @@ bool Current_Cool_State;                                                        
 bool Air_Valve;                                                                           // Air Assist valve on/off
 
 /*
+ *  Time delay
+ */
+#define DELAYTIME(last, delaysize)         ((millis() - last) > delaysize)
+
+/*
  *  Debug State
  */
 bool debugon = false;                                                                     // debug off by default
@@ -207,16 +212,18 @@ struct {
 /*
  *  Turn relay on/off
  */
-void SetRelay(int relay, bool value)
+bool SetRelay(int relay, bool value)
 {
   int b = GETBOARD(relay);                                                                // which relay board
   int r = GETRELAY(relay)-1;                                                              // which relay index (1 less than relay number on board)
   if(relay && relays[b].relayavailable && (value != relays[b].Relaystate[r]))             // relay and relay board available and is the relay state changing
   {
     relays[b].relay->toggleRelay(r+1);                                                    // since we know the relay state, toggle the relay when we want to change it
+                                                                                          // we could query relay state to check if it has changed but we assume it worked
     relays[b].Relaystate[r] = value;                                                      // update internal state to match
     if(debugon) Serial.printf("SetRelay %d %d %s\n", relay, relays[b].Relaystate[r], value?"ON":"OFF");
   }
+  return true;
 }
 
 /*
@@ -409,7 +416,16 @@ void setup()
  *  Monitor timing of main loop and error if too large. Loop times are < 8-9ms, most are < 1ms
  *   Most of the delay is when updating the display, non display times < 1ms
  */
-#define NOLOOPTIME    8
+#define TIMEOVERALL       0
+#define TIMEUPDATEINPUTS  1
+#define TIMEUPDATETEMP    2
+#define TIMECHECKCOOL     3
+#define TIMEAIRASSIST     4
+#define TIMERELAYUPDATE   5
+#define TIMEDISPLAYNOTIF  6
+#define TIMEDISPLAYUPDATE 7
+
+#define NOLOOPTIME      (TIMEDISPLAYUPDATE+1)
 unsigned long looptime[NOLOOPTIME];                                                       // timing of main loop and parts of loop
 #define MAXLOOPTIME     15000                                                             // max loop time in microseconds
 #define SKIPCOUNT       10                                                                // lots of initialization the first few times round loop
@@ -433,16 +449,17 @@ void MonitorTimingLoop()
       if(looptime[i] < mintime[i]) mintime[i] = looptime[i];
       if(looptime[i] > maxtime[i]) maxtime[i] = looptime[i];
       if(looptime[i] > MAXLOOPTIME) maxcount[i]++;
+      looptime[i] = 0;
     }
 
     if(debugon)
     {
       static unsigned long lastdistime = 0;
-      if((millis() - lastdistime) > DEBUGDELAY)
+      if(DELAYTIME(lastdistime, DEBUGDELAY))
       {
         lastdistime = millis();
         Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d\n",
-          (maxtime[0] > MAXLOOPTIME)?" too large":"", avertime[0], mintime[0], maxtime[0], maxcount[0]);
+          (maxtime[0] > MAXLOOPTIME)?" too large":"", avertime[TIMEOVERALL], mintime[TIMEOVERALL], maxtime[TIMEOVERALL], maxcount[TIMEOVERALL]);
         for(int i = 1; i < NOLOOPTIME; i++)
           if(maxtime[i] > MAXLOOPTIME)
             Serial.printf("loop times%d: aver %lu, min %lu, max %lu maxcount %d\n", i, avertime[i], mintime[i], maxtime[i], maxcount[i]);
@@ -472,7 +489,7 @@ void UpdatePinInputs()
   }
   AirAssistValveInput = !pinstate[AIRASSISTPIN];                                          // inverted debounced air assist input pin state
 
-  if(debugon && ((millis() - distime) > DEBUGDELAY))
+  if(debugon && DELAYTIME(distime, DEBUGDELAY))
   {
     static bool aa;
     static short pp[4];
@@ -499,7 +516,7 @@ void UpdateTempInputs()
   intemp[TEMPINDEXC] = map(Currenttemp, 0, ANALOGRANGEMAX, MINEBLOCKTEMP, MAXEBLOCKTEMP);           // linear map of eblock/ADC to temp C * 10
   intemp[TEMPINDEXF] = (intemp[TEMPINDEXC] * 9)/ 5 + 32*TEMP10;                                     // standard translation of C to F, except temp * 10
 
-  if(debugon && ((millis() - distime) > DEBUGDELAY))
+  if(debugon && DELAYTIME(distime, DEBUGDELAY))
   {
     static short T[2];
     distime = millis();
@@ -525,9 +542,11 @@ void ValidateCoolingInputs()
 
   if (Current_Cool_State != newState)                                                     // cooling state has changed
   {
-    Current_Cool_State = newState;
-    if(debugon) Serial.printf("Laser %s\n", Current_Cool_State?"Disabled":"Enabled");
-    SetRelay(RELAY_DISABLELASER, Current_Cool_State);                                     // update whether laser enabled or disabled
+    if(SetRelay(RELAY_DISABLELASER, newState))                                            // update whether laser enabled or disabled
+    {
+      Current_Cool_State = newState;
+      if(debugon) Serial.printf("Laser %s\n", Current_Cool_State?"Disabled":"Enabled");
+    }
   }
 }
 
@@ -539,9 +558,11 @@ void UpdateAirAssistValve()
   bool newState = ButtonState[AIRASSISTBUTTON].state?AirAssistValveInput:true;            // If AirAssist pump is on then follow AirAssist input otherwise valve should be open
   if(Air_Valve != newState)                                                               // Air valve state needs to change
   {
-    Air_Valve = newState;
-    if(debugon) Serial.printf("Air Assist Valve %s\n", Air_Valve?"Open":"Closed");
-    SetRelay(RELAY_AIRASSISTVALVE, Air_Valve);                                            // update Air assist valve relay
+    if(SetRelay(RELAY_AIRASSISTVALVE, newState))                                          // update Air assist valve relay
+    {
+      Air_Valve = newState;
+      if(debugon) Serial.printf("Air Assist Valve %s\n", Air_Valve?"Open":"Closed");
+    }
   }
 }
 
@@ -552,10 +573,8 @@ void UpdateRelayState()
 {
   for(int i = 0; i < BUTTONSTATESIZE; i++)
     if(ButtonState[i].relaystate != ButtonState[i].state)                                 // need to change relay state
-    {
-      ButtonState[i].relaystate = ButtonState[i].state;
-      SetRelay(ButtonState[i].relay, ButtonState[i].relaystate);                          // SetRelay checks a relays current state and changes it if required, 0 is no relay
-    }
+      if(SetRelay(ButtonState[i].relay, ButtonState[i].relaystate))                       // SetRelay checks a relays current state and changes it if required, 0 is no relay
+        ButtonState[i].relaystate = ButtonState[i].state;
 }
 
 /*
@@ -564,16 +583,16 @@ void UpdateRelayState()
 #define UpdateDelay   1000
 #define ERRORBIT(x)   (1<<(x))
 unsigned long errorbits[] = {ERRORBIT(0), ERRORBIT(2), ERRORBIT(4), ERRORBIT(6), ERRORBIT(8), ERRORBIT(10), ERRORBIT(12), ERRORBIT(13), ERRORBIT(14), ERRORBIT(15), ERRORBIT(16) };
-char *ts[] = { "TempF", "TempC", "Pulse 0", "Pulse 1", "Pulse 2", "Pulse 3" };
-NexText *Text[] = { &TempF, &TempC, &c1, &c2, &c3, &c4 };
-char displaybuffer[20];                                                                   // int to text buffer used to update text in display
+char *tsdebug[] = { "TempF", "TempC", "Pulse 0", "Pulse 1", "Pulse 2", "Pulse 3" };
+NexText *TextUI[] = { &TempF, &TempC, &c1, &c2, &c3, &c4 };
+char displaybuffer[15];                                                                   // int to text buffer used to update text in display
 
 bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
 {
   static unsigned int lasttime[6] = {0, 0, 0, 0, 0, 0};
   bool ret = false;
   bool color;
-  if((millis() - lasttime[index]) > UpdateDelay)                                          // slow down updates
+  if(DELAYTIME(lasttime[index], UpdateDelay))                                             // slow down display updates
   {
     if(index <= TEMPINDEXC)
     {
@@ -594,8 +613,8 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
     {
       if(displayavailable)
       {
-        if(!Text[index]->setText(displaybuffer)) *rets |= sret;
-        if(!Text[index]->Set_background_color_bco(color?RED:WHITE)) *rets |= (sret<<1);
+        if(!TextUI[index]->setText(displaybuffer)) *rets |= sret;
+        if(!TextUI[index]->Set_background_color_bco(color?RED:WHITE)) *rets |= (sret<<1);
       }
       if(!*rets)
       {
@@ -603,19 +622,19 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
           oldintemp[index] = intemp[index];                                               // save state if updated display temp
         else
           oldpulseperiod[index-2] = pulseperiod[index-2];                                 // save state if updated display pulse
-        lasttime[index] = millis();
+        lasttime[index] = millis();                                                       // update successful so wait UpdateDelay before checking again
       }
-      if(debugon) Serial.printf("Display %s '%s' %lx\n", ts[index], displaybuffer, *rets);
+      if(debugon) Serial.printf("Display %s '%s' %lx\n", tsdebug[index], displaybuffer, *rets);
     }
     else
-      lasttime[index] = millis();
+      lasttime[index] = millis();                                                         // no change so wait UpdateDelay before checking again
   }
   return ret;
 }
 
-unsigned long UpdateCoolDisplay(unsigned long sret, unsigned long *rets)
+bool UpdateCoolDisplay(unsigned long sret, unsigned long *rets)
 {
-  bool ret = false;
+  bool ret;
   if(ret = (oldCurrent_Cool_State != Current_Cool_State))
   {
     if(displayavailable)
@@ -627,10 +646,9 @@ unsigned long UpdateCoolDisplay(unsigned long sret, unsigned long *rets)
   return ret;
 }
 
-unsigned long UpdateDisplayButton(int index, unsigned long sret, unsigned long *rets)
+bool UpdateDisplayButton(int index, unsigned long sret, unsigned long *rets)
 {
-  bool ret = false;
-
+  bool ret;
   if(ret = (ButtonState[index].oldstate != ButtonState[index].state))
   {
     if(displayavailable)
@@ -670,44 +688,36 @@ void UpdateDisplay()
     }
     ++part %= 11;                                                                         // round robin the 11 parts of display
   } while(!updateddisplay && (startpart != part));                                        // loop until we have tried updating 1 UI part or none needing updating
-  if(rets && debugon) Serial.printf("Display update failures %lx\n", rets);
+  if(rets && debugon) Serial.printf("Display update failures %lx\n", rets);               // did we have any errors when updating display
 }
 
 /*
  *  Main loop
  */
-#define SensorDelay   100
+#define SensorDelay   100                                                                 // Sensor update delay
 
-#define STARTTIME(x)  temptime[x] = micros()                                              // start time of measurement
-#define ENDTIME(i,x)  looptime[i] = micros() - temptime[x]                                // end time of measurement
+#define STARTTIMEL    temptime[1] = micros()                                              // start time of measurement
+#define ENDTIMEL(i)   looptime[i] = micros() - temptime[1]                                // end time of measurement
+#define STARTTIMES    temptime[0] = micros()                                              // start time of measurement
+#define ENDTIMES(i)   looptime[i] = micros() - temptime[0]                                // end time of measurement
 
 void loop()
 {
   static unsigned long lastSensorTime;
-  unsigned long temptime[2];
+  unsigned long temptime[2];                                                              // timing start times
 
   MonitorTimingLoop();                                                                    // Monitor speed of this loop
 
-  STARTTIME(0); STARTTIME(1);                                                             // time main loop and each part of the loop
-  if((millis() - lastSensorTime) > SensorDelay)                                           // update sensors and controller state every SensorDelay milliseconds
+  STARTTIMEL;                                                                             // time main loop
+  if(DELAYTIME(lastSensorTime, SensorDelay))                                              // update sensors and controller state every SensorDelay milliseconds
   {
-    UpdatePinInputs();                                                                    // Update digital pin inputs
-    ENDTIME(1,1); STARTTIME(1);
-    UpdateTempInputs();                                                                   // Update temp input
-    ENDTIME(2,1); STARTTIME(1);
-    
-    ValidateCoolingInputs();                                                              // Check if we have a cooling problem
-    ENDTIME(3,1); STARTTIME(1);
-    UpdateAirAssistValve();                                                               // Enable air assist valve if requested
-    ENDTIME(4,1); STARTTIME(1);
-    UpdateRelayState();                                                                   // Update relay state for buttons
-    ENDTIME(5,1); STARTTIME(1);
+    STARTTIMES;   UpdatePinInputs();        ENDTIMES(TIMEUPDATEINPUTS);                   // Update digital pin inputs
+    STARTTIMES;   UpdateTempInputs();       ENDTIMES(TIMEUPDATETEMP);                     // Update temp input
+    STARTTIMES;   ValidateCoolingInputs();  ENDTIMES(TIMECHECKCOOL);                      // Check if we have a cooling problem
+    STARTTIMES;   UpdateAirAssistValve();   ENDTIMES(TIMEAIRASSIST);                      // Enable air assist valve if requested
+    STARTTIMES;   UpdateRelayState();       ENDTIMES(TIMERELAYUPDATE);                    // Update relay state for buttons
   }
-
-  nexLoop(nex_listen_list);                                                               // Get any button events from display
-  ENDTIME(6,1); STARTTIME(1);
-
-  UpdateDisplay();                                                                        // Update display for current state
-  ENDTIME(7,1);
-  ENDTIME(0,0);
+  STARTTIMES;     nexLoop(nex_listen_list); ENDTIMES(TIMEDISPLAYNOTIF);                   // Get any button events from display
+  STARTTIMES;     UpdateDisplay();          ENDTIMES(TIMEDISPLAYUPDATE);                  // Update display for current state
+  ENDTIMEL(TIMEOVERALL);                                                                  // time main loop
 }
