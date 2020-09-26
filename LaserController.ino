@@ -90,7 +90,7 @@ bool Air_Valve;                                                                 
  *  Time delay
  */
 #define DELAYTIME(last, delaysize)         ((millis() - last) > delaysize)
-
+#define UPDATETIME(last)                   (last = millis())
 /*
  *  Debug State
  */
@@ -457,7 +457,7 @@ void MonitorTimingLoop()
       static unsigned long lastdistime = 0;
       if(DELAYTIME(lastdistime, DEBUGDELAY))
       {
-        lastdistime = millis();
+        UPDATETIME(lastdistime);
         Serial.printf("Loop times%s: aver %lu, min %lu, max %lu maxcount %d\n",
           (maxtime[0] > MAXLOOPTIME)?" too large":"", avertime[TIMEOVERALL], mintime[TIMEOVERALL], maxtime[TIMEOVERALL], maxcount[TIMEOVERALL]);
         for(int i = 1; i < NOLOOPTIME; i++)
@@ -493,11 +493,11 @@ void UpdatePinInputs()
   {
     static bool aa;
     static short pp[4];
+    UPDATETIME(distime);
     if(((aa != AirAssistValveInput) || (pp[0] != pulseperiod[0]) || (pp[1] != pulseperiod[1]) || (pp[2] != pulseperiod[2]) || (pp[3] != pulseperiod[3])))
     {
       Serial.printf("Sensor %d %d %d %d %d\n", pulseperiod[0], pulseperiod[1], pulseperiod[2], pulseperiod[3], AirAssistValveInput);
       aa = AirAssistValveInput; pp[0] = pulseperiod[0]; pp[1] = pulseperiod[1]; pp[2] = pulseperiod[2]; pp[3] = pulseperiod[3];
-      distime = millis();
     }
   }
 }
@@ -519,7 +519,7 @@ void UpdateTempInputs()
   if(debugon && DELAYTIME(distime, DEBUGDELAY))
   {
     static short T[2];
-    distime = millis();
+    UPDATETIME(distime);
     if((T[TEMPINDEXF] != intemp[TEMPINDEXF]) || (T[TEMPINDEXC] != intemp[TEMPINDEXC]))
     {
       Serial.printf("Temp Sensor %d %d\n", intemp[TEMPINDEXC], intemp[TEMPINDEXF]);
@@ -622,12 +622,12 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
           oldintemp[index] = intemp[index];                                               // save state if updated display temp
         else
           oldpulseperiod[index-2] = pulseperiod[index-2];                                 // save state if updated display pulse
-        lasttime[index] = millis();                                                       // update successful so wait UpdateDelay before checking again
+        UPDATETIME(lasttime[index]);                                                      // update successful so wait UpdateDelay before checking again
       }
       if(debugon) Serial.printf("Display %s '%s' %lx\n", tsdebug[index], displaybuffer, *rets);
     }
     else
-      lasttime[index] = millis();                                                         // no change so wait UpdateDelay before checking again
+      UPDATETIME(lasttime[index]);                                                        // no change so wait UpdateDelay before checking again
   }
   return ret;
 }
@@ -711,6 +711,7 @@ void loop()
   STARTTIMEL;                                                                             // time main loop
   if(DELAYTIME(lastSensorTime, SensorDelay))                                              // update sensors and controller state every SensorDelay milliseconds
   {
+    UPDATETIME(lastSensorTime);
     STARTTIMES;   UpdatePinInputs();        ENDTIMES(TIMEUPDATEINPUTS);                   // Update digital pin inputs
     STARTTIMES;   UpdateTempInputs();       ENDTIMES(TIMEUPDATETEMP);                     // Update temp input
     STARTTIMES;   ValidateCoolingInputs();  ENDTIMES(TIMECHECKCOOL);                      // Check if we have a cooling problem
