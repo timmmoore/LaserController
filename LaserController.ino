@@ -64,21 +64,28 @@
 #define TEMPLOWPASSFILTER   8                                                             // low pass filter on temperature analogRead
 #define PULSELOWPASSFILTER  4                                                             // low pass filter on pulse periods
 
+/*
+ * Temp indexes
+ */
 #define TEMPINDEXF          0                                                             // Temp F
 #define TEMPINDEXC          1                                                             // Temp C
+#define NOTEMP              2
 /* 
  *  digital input and temperature input values 
  */
 bool AirAssistValveInput = true;                                                          // Air assist input from Main Controller
-short intemp[2];                                                                          // Temperatures F and C
-volatile unsigned short pulseperiod[4];                                                   // input pulses/sec, output from interrupt handlers
+short intemp[NOTEMP];                                                                     // Temperatures F and C
+volatile unsigned short pulseperiod[4];                                                   // input pulses/sec, output from interrupt handlers for 4 input pulse pins
 
+#define NOPULSEINPUTS   sizeof(pulseperiod)/sizeof(pulseperiod[0])
 /* 
- *  last UI values - save updating UI except when needed
+ *  last UI values - save updating UI except when it needs to change
  */
 bool oldCurrent_Cool_State;
-short oldintemp[2];
-unsigned short oldpulseperiod[4];
+short oldintemp[NOTEMP];
+unsigned short oldpulseperiod[NOPULSEINPUTS];
+
+
 
 /* 
  *  Controller state 
@@ -89,8 +96,9 @@ bool Air_Valve;                                                                 
 /*
  *  Time delay
  */
-#define DELAYTIME(last, delaysize)         ((millis() - last) > delaysize)
-#define UPDATETIME(last)                   (last = millis())
+#define DELAYTIME(last, delaysize)         ((millis() - last) > delaysize)                // right time gone bye
+#define UPDATETIME(last)                   (last = millis())                              // update time for next check
+
 /*
  *  Debug State
  */
@@ -105,8 +113,8 @@ bool debugon = false;                                                           
 #define LED_OFF                 HIGH
 #define LED_ON                  LOW
 
-#define errorState digitalWrite(LED_PIN, LED_ON)
-#define clearState digitalWrite(LED_PIN, LED_OFF)
+#define errorState digitalWrite(LED_PIN, LED_ON)                                          // error - led on
+#define clearState digitalWrite(LED_PIN, LED_OFF)                                         // clear error - led off
 
 /* 
  *  local sensor information and state 
@@ -123,7 +131,7 @@ bool debugon = false;                                                           
 
 const unsigned long debounceDelay = 5000;                                                 // the debounce time (us), max freq 100/sec
 const unsigned long stoppedDelay = 1000000;                                               // after 1sec without any pin state changes, set to 0 pulses/sec
-const byte pinpin[] = { TIME_PIN0, TIME_PIN1, TIME_PIN2, TIME_PIN3, INPUT_PIN };
+const byte pinpin[] = { TIME_PIN0, TIME_PIN1, TIME_PIN2, TIME_PIN3, INPUT_PIN };          // set of pins for interrupt handling
 
 #define PINPINSIZE              (sizeof(pinpin)/sizeof(pinpin[0]))
 #define AIRASSISTPIN            4                                                         // pinstate index for Air Assist pin state
@@ -133,8 +141,8 @@ const byte pinpin[] = { TIME_PIN0, TIME_PIN1, TIME_PIN2, TIME_PIN3, INPUT_PIN };
  */
 volatile byte pinstate[PINPINSIZE];                                                       // debounced pin state
 volatile unsigned long debtime[PINPINSIZE];                                               // time of last pin change for debounce
-volatile unsigned long risetime[PINPINSIZE];                                              // time of last debounced rising edge
-volatile unsigned long averriseperiodtemp[PINPINSIZE];                                    // time of last rising to rising edge period
+volatile unsigned long risetime[NOPULSEINPUTS];                                           // time of last debounced rising edge
+volatile unsigned long averriseperiodtemp[NOPULSEINPUTS];                                 // time of last rising to rising edge period
 
 /*
  *  Display information
@@ -250,7 +258,7 @@ struct _ButtonState
                     { false, true, RELAY_LIGHTS, false, &LightsOn } };
 
 /*
- *  Button callback handlers
+ *  Button callback handlers, update button state
  */
 void ButtonCallback(void *p)
 {
@@ -362,7 +370,9 @@ void setupSensors()
   {
     pinMode(pinpin[i], INPUT_PULLUP);                                                     // pulse in pins and air assist input pin
     pinstate[i] = digitalRead(pinpin[i]);                                                 // initialize pin state
-    debtime[i] = risetime[i] = micros();                                                  // initialize timers
+    debtime[i] = micros();                                                                // initialize timers
+    if(i != AIRASSISTPIN)
+      risetime[i] = micros();                                                             // initialize timers
     attachInterrupt(digitalPinToInterrupt(pinpin[i]), int_table[i], CHANGE);              // interrupts on each pin
   }
 }
@@ -469,13 +479,13 @@ void MonitorTimingLoop()
 }
 
 /*
- *  get sensor values from pulse, air assist input interrupt state and translate them into useful state
+ *  get sensor values from pulse, air assist input interrupt state and translate them into useful values we can act on
  */
 void UpdatePinInputs()
 {
   static unsigned long distime;
 
-  for(int i = 0;i < sizeof(pulseperiod)/sizeof(pulseperiod[0]);i++)                       // note using size of pulseperiod because that will be reset and its smaller than other interrupt arrays
+  for(int i = 0;i < NOPULSEINPUTS;i++)                                                    // note using size of pulseperiod because that is what will be reset
   {
     unsigned long d = debtime[i];
     unsigned long m = micros();
@@ -492,7 +502,7 @@ void UpdatePinInputs()
   if(debugon && DELAYTIME(distime, DEBUGDELAY))
   {
     static bool aa;
-    static short pp[4];
+    static short pp[NOPULSEINPUTS];
     UPDATETIME(distime);
     if(((aa != AirAssistValveInput) || (pp[0] != pulseperiod[0]) || (pp[1] != pulseperiod[1]) || (pp[2] != pulseperiod[2]) || (pp[3] != pulseperiod[3])))
     {
@@ -503,7 +513,7 @@ void UpdatePinInputs()
 }
 
 /*
- *  get temp sensor value and translate it into actual temperatures
+ *  get temp sensor value and translate it into actual temperatures C and F
  */
 #define MINEBLOCKTEMP   (-22*TEMP10)
 #define MAXEBLOCKTEMP   (56*TEMP10)
@@ -518,7 +528,7 @@ void UpdateTempInputs()
 
   if(debugon && DELAYTIME(distime, DEBUGDELAY))
   {
-    static short T[2];
+    static short T[NOTEMP];
     UPDATETIME(distime);
     if((T[TEMPINDEXF] != intemp[TEMPINDEXF]) || (T[TEMPINDEXC] != intemp[TEMPINDEXC]))
     {
@@ -529,7 +539,7 @@ void UpdateTempInputs()
 }
 
 /*
- *  Check whether we are cooling laser correctly and disable laser if there is a problem
+ *  Check whether we are cooling laser correctly, update cooling state and disable laser if there is a problem
  */
 #define TEMPOUTOFRANGE           ((intemp[TEMPINDEXC] < MINTEMP) || (intemp[TEMPINDEXC] > MAXTEMP))
 #define PULSEOUTOFRANGE(i)       ((pulseperiod[i] < MINPULSEFREQ) || (pulseperiod[i] > MAXPULSEFREQ))
@@ -551,7 +561,7 @@ void ValidateCoolingInputs()
 }
 
 /*
- *  Calculate air assist valve state
+ *  Calculate air assist valve state and update relay for air assist valve
  */
 void UpdateAirAssistValve()
 {
@@ -567,7 +577,7 @@ void UpdateAirAssistValve()
 }
 
 /*
- *  Update relay state to match button state
+ *  Update relay state to match button state, if relay assigned to a button
  */
 void UpdateRelayState()
 {
@@ -587,6 +597,9 @@ char *tsdebug[] = { "TempF", "TempC", "Pulse 0", "Pulse 1", "Pulse 2", "Pulse 3"
 NexText *TextUI[] = { &TempF, &TempC, &c1, &c2, &c3, &c4 };
 char displaybuffer[15];                                                                   // int to text buffer used to update text in display
 
+/*
+ * Update temp display and pulse display values
+ */
 bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
 {
   static unsigned int lasttime[6] = {0, 0, 0, 0, 0, 0};
@@ -602,12 +615,12 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
     }
     else
     {
-      ret = (oldpulseperiod[index-2] != pulseperiod[index-2]);                            // pps changed
-      if(pulseperiod[index-2])
-        sprintf(displaybuffer, "%d.%d", pulseperiod[index-2]/PULSE100, pulseperiod[index-2]%PULSE100); // format for pulses
+      ret = (oldpulseperiod[index-NOTEMP] != pulseperiod[index-NOTEMP]);                  // pps changed
+      if(pulseperiod[index-NOTEMP])
+        sprintf(displaybuffer, "%d.%d", pulseperiod[index-NOTEMP]/PULSE100, pulseperiod[index-NOTEMP]%PULSE100); // format for pulses
       else
         strcpy(displaybuffer, "stopped");                                                 // no pulses
-      color = PULSEOUTOFRANGE(index-2);
+      color = PULSEOUTOFRANGE(index-NOTEMP);
     }
     if(ret)                                                                               // we have an update to do
     {
@@ -618,10 +631,10 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
       }
       if(!*rets)
       {
-        if(index < 2)
+        if(index < NOTEMP)
           oldintemp[index] = intemp[index];                                               // save state if updated display temp
         else
-          oldpulseperiod[index-2] = pulseperiod[index-2];                                 // save state if updated display pulse
+          oldpulseperiod[index-NOTEMP] = pulseperiod[index-NOTEMP];                       // save state if updated display pulse
         UPDATETIME(lasttime[index]);                                                      // update successful so wait UpdateDelay before checking again
       }
       if(debugon) Serial.printf("Display %s '%s' %lx\n", tsdebug[index], displaybuffer, *rets);
@@ -632,6 +645,9 @@ bool UpdateTPDisplay(int index, unsigned long sret, unsigned long *rets)
   return ret;
 }
 
+/*
+ * Update cooling ok display state
+ */
 bool UpdateCoolDisplay(unsigned long sret, unsigned long *rets)
 {
   bool ret;
@@ -646,6 +662,9 @@ bool UpdateCoolDisplay(unsigned long sret, unsigned long *rets)
   return ret;
 }
 
+/*
+ * Updare button display state to match our button state
+ */
 bool UpdateDisplayButton(int index, unsigned long sret, unsigned long *rets)
 {
   bool ret;
